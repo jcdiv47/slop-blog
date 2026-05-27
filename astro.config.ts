@@ -11,6 +11,7 @@ import remarkToc from "remark-toc";
 import remarkCollapse from "remark-collapse";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import rehypeKatexHeadingText from "./src/utils/rehypeKatexHeadingText";
 import {
   transformerNotationDiff,
   transformerNotationHighlight,
@@ -37,7 +38,8 @@ export default defineConfig({
   },
   markdown: {
     remarkPlugins: [remarkMath, remarkToc, [remarkCollapse, { test: "Table of contents" }]],
-    rehypePlugins: [rehypeKatex],
+    // rehypeKatexHeadingText must run after rehypeKatex; see plugin source for why.
+    rehypePlugins: [rehypeKatex, rehypeKatexHeadingText],
     shikiConfig: {
       themes: { light: "min-light", dark: "night-owl" },
       defaultColor: false,

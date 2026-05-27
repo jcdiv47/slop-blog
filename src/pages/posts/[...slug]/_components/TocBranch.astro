@@ -1,0 +1,57 @@
+---
+import type { MarkdownHeading } from "astro";
+
+type TocNode = MarkdownHeading & { children: TocNode[] };
+
+interface Props {
+  items: TocNode[];
+  isRoot?: boolean;
+  listId?: string;
+}
+
+const { items, isRoot = false, listId } = Astro.props;
+---
+
+<ul
+  class:list={["toc-list", { "toc-root": isRoot }]}
+  id={listId}
+  aria-hidden={!isRoot ? "true" : undefined}
+>
+  {
+    items.map(item => {
+      const hasChildren = item.children.length > 0;
+      const childrenId = `toc-children-${item.slug}`;
+      return (
+        <li
+          class:list={[
+            `toc-depth-${item.depth}`,
+            "toc-item",
+            { "has-children": hasChildren },
+          ]}
+          data-toc-item
+        >
+          {hasChildren && (
+            <button
+              type="button"
+              class="toc-expander"
+              aria-expanded="false"
+              aria-controls={childrenId}
+              aria-label={`Expand subsections for ${item.text}`}
+              data-toc-expander
+            >
+              <span class="toc-expander-icon" aria-hidden="true">
+                ›
+              </span>
+            </button>
+          )}
+          <a href={`#${item.slug}`} data-toc-link>
+            {item.text}
+          </a>
+          {hasChildren && (
+            <Astro.self items={item.children} listId={childrenId} />
+          )}
+        </li>
+      );
+    })
+  }
+</ul>
