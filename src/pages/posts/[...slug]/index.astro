@@ -13,6 +13,7 @@ import ShareLinks from "./_components/ShareLinks.astro";
 import BackButton from "./_components/BackButton.astro";
 import BackToTopButton from "./_components/BackToTopButton.astro";
 import AdjacentPostNav from "./_components/AdjacentPostNav.astro";
+import PostTableOfContents from "./_components/PostTableOfContents.astro";
 import config from "@/config";
 
 export async function getStaticPaths() {
@@ -70,7 +71,7 @@ const {
   hideEditPost,
 } = post.data;
 
-const { Content } = await render(post);
+const { Content, headings } = await render(post);
 
 let ogImageUrl: string | undefined;
 
@@ -107,40 +108,46 @@ const ogImage = ogImageUrl
 
   <main
     id="main-content"
-    class:list={["app-layout", { "mt-8": !config.features.showBackButton }]}
+    class:list={["post-layout", { "mt-8": !config.features.showBackButton }]}
     data-pagefind-body
   >
-    <h1
-      style={{ viewTransitionName: slugifyStr(title.replaceAll(".", "-")) }}
-      class="text-accent inline-block text-2xl font-bold sm:text-3xl"
-    >
-      {title}
-    </h1>
-
-    <div class="my-2 flex items-center gap-2">
-      <Datetime {pubDatetime} {modDatetime} {timezone} size="lg" />
-      <span
-        aria-hidden="true"
-        class:list={[
-          "text-muted-foreground max-sm:hidden",
-          { hidden: !config.features.editPost?.enabled || hideEditPost },
-        ]}
+    <div class="post-heading">
+      <h1
+        style={{ viewTransitionName: slugifyStr(title.replaceAll(".", "-")) }}
+        class="text-accent inline-block text-2xl font-bold sm:text-3xl"
       >
-        |
-      </span>
-      <EditPost {hideEditPost} {post} class="max-sm:hidden" />
+        {title}
+      </h1>
+
+      <div class="my-2 flex items-center gap-2">
+        <Datetime {pubDatetime} {modDatetime} {timezone} size="lg" />
+        <span
+          aria-hidden="true"
+          class:list={[
+            "text-muted-foreground max-sm:hidden",
+            { hidden: !config.features.editPost?.enabled || hideEditPost },
+          ]}
+        >
+          |
+        </span>
+        <EditPost {hideEditPost} {post} class="max-sm:hidden" />
+      </div>
     </div>
 
-    <article
-      id="article"
-      class:list={[
-        "mt-8 w-full",
-        "app-prose max-w-app",
-        "prose-pre:bg-(--shiki-light-bg) dark:prose-pre:bg-(--shiki-dark-bg)",
-      ]}
-    >
-      <Content />
-    </article>
+    <div class="post-content-shell">
+      <PostTableOfContents {headings} />
+
+      <article
+        id="article"
+        class:list={[
+          "post-content",
+          "app-prose",
+          "prose-pre:bg-(--shiki-light-bg) dark:prose-pre:bg-(--shiki-dark-bg)",
+        ]}
+      >
+        <Content />
+      </article>
+    </div>
 
     <hr class="my-8 border-dashed" />
 
@@ -258,6 +265,145 @@ const ogImage = ogImageUrl
     }
   }
   attachCopyButtons();
+
+  function attachPostTableOfContents() {
+    const toc = document.querySelector("[data-post-toc]");
+    if (!toc) return;
+
+    const marker = toc.querySelector("[data-post-toc-marker]");
+    const links = Array.from(toc.querySelectorAll("[data-toc-link]"));
+    const expanders = Array.from(toc.querySelectorAll("[data-toc-expander]"));
+    const headingLinks = links
+      .map(link => {
+        const id = link.getAttribute("href")?.slice(1);
+        const heading = id ? document.getElementById(id) : null;
+        return heading ? { heading, link } : null;
+      })
+      .filter(Boolean);
+
+    if (!headingLinks.length) return;
+
+    let activeLink = null;
+
+    function setExpanded(item, expanded) {
+      if (item.classList.contains("is-expanded") === expanded) return;
+      item.classList.toggle("is-expanded", expanded);
+      const button = item.querySelector(":scope > .toc-expander");
+      const childList = item.querySelector(":scope > .toc-list");
+      if (button) button.setAttribute("aria-expanded", String(expanded));
+      if (childList) {
+        childList.setAttribute("aria-hidden", String(!expanded));
+        if (expanded) {
+          // Measure the natural height so the max-height transition lands
+          // exactly on the content size instead of an arbitrary fallback.
+          childList.style.setProperty(
+            "--post-toc-child-height",
+            childList.scrollHeight + "px"
+          );
+        }
+      }
+    }
+
+    function expandAncestors(link) {
+      let item = link.closest("[data-toc-item]");
+      while (item) {
+        setExpanded(item, true);
+        item = item.parentElement?.closest("[data-toc-item]") ?? null;
+      }
+    }
+
+    function positionMarker(link) {
+      if (!marker || !link) return;
+      const linkRect = link.getBoundingClientRect();
+      const tocRect = toc.getBoundingClientRect();
+      const y =
+        linkRect.top - tocRect.top + toc.scrollTop + linkRect.height / 2;
+      toc.style.setProperty("--post-toc-marker-y", y + "px");
+      toc.classList.add("has-active-marker");
+    }
+
+    function setActive(link) {
+      activeLink = link;
+      for (const l of links) {
+        if (l === link) l.setAttribute("aria-current", "location");
+        else l.removeAttribute("aria-current");
+      }
+      expandAncestors(link);
+      positionMarker(link);
+    }
+
+    for (const button of expanders) {
+      button.addEventListener("click", () => {
+        const item = button.closest("[data-toc-item]");
+        if (!item) return;
+        setExpanded(item, !item.classList.contains("is-expanded"));
+        requestAnimationFrame(() => positionMarker(activeLink));
+      });
+    }
+
+    const observer = new IntersectionObserver(
+      entries => {
+        const visibleHeadings = entries
+          .filter(entry => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+
+        const active = headingLinks.find(
+          item => item?.heading === visibleHeadings[0]?.target
+        );
+        if (active) setActive(active.link);
+      },
+      {
+        rootMargin: "-18% 0px -68% 0px",
+        threshold: 0,
+      }
+    );
+
+    for (const item of headingLinks) {
+      if (item) observer.observe(item.heading);
+    }
+
+    // Children shifting size during the expand transition would leave the
+    // marker stranded — repos when a list's transition finishes, and on resize.
+    toc.addEventListener("transitionend", event => {
+      const target = event.target;
+      if (target && target.classList && target.classList.contains("toc-list")) {
+        positionMarker(activeLink);
+      }
+    });
+    window.addEventListener("resize", () => positionMarker(activeLink));
+
+    // Seed an initial active state so the marker is visible before the first
+    // intersection callback fires.
+    if (links[0]) setActive(links[0]);
+  }
+  attachPostTableOfContents();
+
+  function alignTocToFirstParagraph() {
+    const shell = document.querySelector(".post-content-shell");
+    const toc = document.querySelector("[data-post-toc]");
+    const article = document.getElementById("article");
+    if (!shell || !toc || !article) return;
+
+    const firstParagraph = article.querySelector(":scope > p:first-of-type");
+    if (!firstParagraph) {
+      shell.style.removeProperty("--post-toc-offset-y");
+      return;
+    }
+
+    const shellRect = shell.getBoundingClientRect();
+    const paragraphRect = firstParagraph.getBoundingClientRect();
+    const offsetY = Math.max(0, paragraphRect.top - shellRect.top);
+
+    shell.style.setProperty("--post-toc-offset-y", `${offsetY}px`);
+  }
+  alignTocToFirstParagraph();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(alignTocToFirstParagraph);
+  });
+
+  window.addEventListener("resize", alignTocToFirstParagraph);
+  window.addEventListener("load", alignTocToFirstParagraph);
+  document.addEventListener("astro:after-swap", alignTocToFirstParagraph);
 
   document.addEventListener("astro:after-swap", () =>
     window.scrollTo({ left: 0, top: 0, behavior: "instant" })

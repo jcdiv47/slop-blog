@@ -1,0 +1,53 @@
+---
+import type { MarkdownHeading } from "astro";
+import TocBranch from "./TocBranch.astro";
+
+type TocNode = MarkdownHeading & { children: TocNode[] };
+
+interface Props {
+  headings: MarkdownHeading[];
+}
+
+const { headings } = Astro.props;
+
+const tocHeadings = headings.filter(
+  heading =>
+    heading.depth >= 2 &&
+    heading.depth <= 4 &&
+    heading.slug &&
+    heading.text.trim().toLowerCase() !== "table of contents"
+);
+
+const tree: TocNode[] = [];
+const stack: TocNode[] = [];
+
+for (const heading of tocHeadings) {
+  const node: TocNode = { ...heading, children: [] };
+
+  while (stack.length > 0 && stack[stack.length - 1].depth >= node.depth) {
+    stack.pop();
+  }
+
+  if (stack.length === 0) {
+    tree.push(node);
+  } else {
+    stack[stack.length - 1].children.push(node);
+  }
+
+  stack.push(node);
+}
+---
+
+{
+  tree.length > 0 && (
+    <nav
+      id="post-toc"
+      class="post-toc"
+      aria-label="Table of contents"
+      data-post-toc
+    >
+      <TocBranch items={tree} isRoot />
+      <span class="post-toc-marker" aria-hidden="true" data-post-toc-marker />
+    </nav>
+  )
+}

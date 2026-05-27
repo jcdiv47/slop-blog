@@ -28,10 +28,206 @@
   @apply max-w-app mx-auto w-full px-4;
 }
 
+@utility post-layout {
+  @apply max-w-app mx-auto w-full px-4;
+}
+
 @utility active-nav {
   @apply underline decoration-wavy decoration-2 underline-offset-8;
 }
 
 :target {
   scroll-margin-block: 1rem;
+}
+
+.post-content-shell {
+  --post-toc-width: 13.25rem;
+  --post-toc-gap: 2rem;
+  @apply mt-8 grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.post-content {
+  @apply w-full max-w-none;
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.post-toc {
+  --post-toc-chevron-gutter: 1.3rem;
+  @apply text-muted-foreground overflow-y-auto leading-snug;
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
+  width: var(--post-toc-width);
+  padding-inline-start: var(--post-toc-chevron-gutter);
+  font-size: 12px;
+  max-height: calc(100svh - 3rem);
+  transform: translate(
+    calc(-100% - var(--post-toc-gap)),
+    var(--post-toc-offset-y, 0px)
+  );
+  position: sticky;
+  top: 1.5rem;
+  scrollbar-width: none;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity 0.75s ease;
+}
+
+.post-toc:hover,
+.post-toc:focus-within {
+  opacity: 1;
+}
+
+.post-toc::-webkit-scrollbar {
+  display: none;
+}
+
+.post-toc ul {
+  @apply m-0 list-none p-0;
+}
+
+.post-toc ul ul {
+  padding-inline-start: 0.85rem;
+  margin-top: 0.35rem;
+}
+
+.post-toc li {
+  @apply relative mb-3;
+}
+
+.post-toc li.toc-depth-3,
+.post-toc li.toc-depth-4 {
+  @apply mb-2;
+}
+
+.post-toc a {
+  @apply text-muted-foreground no-underline transition-colors;
+  display: inline-block;
+}
+
+.post-toc a:hover,
+.post-toc a:focus-visible,
+.post-toc a[aria-current="location"] {
+  @apply text-foreground;
+}
+
+/* Chevron button — invisible at rest, fades in on hover / keyboard focus */
+.post-toc .toc-expander {
+  @apply text-muted-foreground;
+  position: absolute;
+  inset-inline-start: calc(-1 * var(--post-toc-chevron-gutter) + 0.15rem);
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1.4em;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  opacity: 0;
+  transition:
+    opacity 0.2s ease,
+    color 0.2s ease;
+}
+
+.post-toc .toc-item.has-children:hover > .toc-expander,
+.post-toc .toc-expander:focus-visible {
+  @apply text-foreground;
+  opacity: 1;
+}
+
+.post-toc .toc-expander-icon {
+  display: block;
+  font-size: 1.1em;
+  line-height: 1;
+  transform: translateX(-1px);
+  transition: transform 0.2s ease;
+}
+
+.post-toc .toc-item.is-expanded > .toc-expander .toc-expander-icon {
+  transform: rotate(90deg) translateX(-1px);
+}
+
+/* Children: collapsed by default; max-height target comes from JS measurement */
+.post-toc .toc-item.has-children > .toc-list {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  visibility: hidden;
+  transition:
+    max-height 0.24s ease,
+    opacity 0.18s ease,
+    visibility 0s linear 0.24s;
+}
+
+.post-toc .toc-item.has-children.is-expanded > .toc-list {
+  max-height: var(--post-toc-child-height, 24rem);
+  opacity: 1;
+  visibility: visible;
+  transition:
+    max-height 0.28s ease,
+    opacity 0.2s ease,
+    visibility 0s linear 0s;
+}
+
+/* Single dot that animates between active items, sits in the chevron gutter */
+.post-toc-marker {
+  --post-toc-marker-size: 0.25rem;
+  @apply bg-foreground;
+  position: absolute;
+  top: 0;
+  inset-inline-start: calc(
+    (var(--post-toc-chevron-gutter) - var(--post-toc-marker-size)) / 2
+  );
+  width: var(--post-toc-marker-size);
+  height: var(--post-toc-marker-size);
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate3d(
+    0,
+    calc(var(--post-toc-marker-y, 0px) - 50%),
+    0
+  );
+  transition:
+    transform 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.18s ease;
+  will-change: transform;
+}
+
+.post-toc.has-active-marker .post-toc-marker {
+  opacity: 1;
+}
+
+/* Hide the dot when the active item itself is hovered / its chevron is
+   focused — chevron and marker share the gutter and would overlap.
+   (Nested :has() isn't allowed, so the active-link check is folded into
+    the combinator chain instead.) */
+.post-toc:has(.toc-item.has-children:hover > a[aria-current="location"])
+  .post-toc-marker,
+.post-toc:has(
+    .toc-item.has-children
+      > .toc-expander:focus-visible
+      + a[aria-current="location"]
+  )
+  .post-toc-marker {
+  opacity: 0;
+}
+
+@media (max-width: 1279px) {
+  .post-layout {
+    @apply max-w-app;
+  }
+
+  .post-content-shell {
+    @apply block;
+  }
+
+  .post-toc {
+    display: none;
+  }
 }
