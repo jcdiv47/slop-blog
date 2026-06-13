@@ -62,6 +62,23 @@
       }
     }
 
+    table {
+      display: block;
+      max-width: 100%;
+      min-width: 100%;
+      width: max-content;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior-inline: contain;
+    }
+
+    [data-table-variant] table {
+      display: table;
+      width: max-content;
+      overflow: visible;
+    }
+
     code {
       @apply bg-muted/75 text-foreground rounded p-1 wrap-break-word before:content-none after:content-none;
     }
@@ -75,7 +92,11 @@
     }
 
     details {
-      @apply text-foreground inline-block cursor-pointer select-none [&_p]:hidden [&_ul]:my-0!;
+      @apply text-foreground inline-block [&_ul]:my-0!;
+    }
+
+    details > p:empty {
+      @apply hidden;
     }
 
     summary {
@@ -92,6 +113,29 @@
   .app-prose .katex *,
   .app-prose .katex-display {
     @apply text-foreground;
+  }
+
+  .app-prose .katex-display {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-block: 0.125rem 0.375rem;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-inline: contain;
+  }
+
+  .app-prose .katex-display > .katex {
+    max-width: none;
+  }
+
+  .app-prose :where(p, li, td, th) > .katex {
+    display: inline-block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    vertical-align: middle;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-inline: contain;
   }
 
   /* ===== Code Blocks & Syntax Highlighting ===== */
@@ -117,6 +161,55 @@
     }
     .highlighted-word {
       @apply border-border rounded-sm border px-0.5 py-px;
+    }
+  }
+
+  /* ===== Margin notes (authored via :::aside or :aside[…]) =====
+     Narrow viewports: render in-flow as a left-bordered callout.
+     Wide viewports: float into the right margin of the reading column.
+     Deliberately quiet — small, tight, muted so it doesn't pull the eye
+     away from the main reading column. */
+  .app-prose .marginnote {
+    display: block;
+    margin: 1.25em 0;
+    padding: 0.5em 0.9em;
+    border-left: 2px solid var(--color-border);
+    font-family: "Iowan Old Style BT", Georgia, serif;
+    font-size: 0.9em;
+    line-height: 1.45;
+    opacity: 0.75;
+    @apply text-muted-foreground;
+  }
+  .app-prose .marginnote,
+  .app-prose .marginnote p,
+  .app-prose .marginnote li,
+  .app-prose .marginnote strong,
+  .app-prose .marginnote code {
+    @apply text-muted-foreground;
+  }
+  .app-prose .marginnote p {
+    margin: 0.35em 0;
+  }
+  .app-prose .marginnote > :first-child {
+    margin-top: 0;
+  }
+  .app-prose .marginnote > :last-child {
+    margin-bottom: 0;
+  }
+
+  @media (min-width: 1100px) {
+    .app-prose {
+      overflow: visible;
+    }
+    .app-prose .marginnote {
+      float: right;
+      clear: right;
+      width: 14rem;
+      margin: 0.25rem -16rem 0.75rem 0;
+      padding: 0;
+      border-left: none;
+      font-size: 0.8em;
+      line-height: 1.15;
     }
   }
 }

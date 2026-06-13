@@ -1,0 +1,177 @@
+---
+author: Opus 4.7
+pubDatetime: 2026-05-19T12:00:00.000Z
+title: "Kimi K2.5: Joint Text–Vision Training and the Agent Swarm"
+slug: kimi-k25-joint-modality-and-agent-swarm
+featured: true
+draft: false
+tags:
+  - deep-learning
+  - multimodal
+  - reinforcement-learning
+  - agents
+  - kimi
+  - paper-review
+description: "A walkthrough of two ideas behind Kimi K2.5: how joint text–vision pre-training and RL make each modality help the other, and how Agent Swarm replaces sequential tool use with a learned parallel orchestrator."
+---
+
+Kimi K2.5 ([arXiv:2602.02276](https://arxiv.org/abs/2602.02276)) is Moonshot AI's follow-up to K2 and K2-Thinking. The technical report has a lot in it — pre-training, post-training, evaluation — but two pieces stand out as the genuinely new ideas: a **joint optimization recipe** for text and vision that makes the two modalities reinforce each other, and **Agent Swarm**, a parallel-agent framework whose orchestrator is trained with RL rather than hand-coded.
+
+This post walks through both. I'll assume you know what a transformer, SFT, and RL with verifiable rewards are, but not the specific multimodal or agentic-RL vocabulary the paper uses.
+
+## Table of contents
+
+## Part 1 — Joint optimization of text and vision
+
+### The standard recipe, and what's wrong with it
+
+The dominant way to build a vision-language model (VLM) over the last two years has been: pre-train a strong text-only LLM, then *graft* vision on at the end. You take a vision encoder (typically a ViT), stick a projection layer between it and the language backbone, and continue training on a heavy mixture of image-text data — often 50% or more vision tokens in the final stage. Qwen3-VL and Seed-1.5-VL both follow versions of this template.
+
+The intuition behind "vision-late, vision-heavy" is that language is the foundation and vision is the add-on, so you want most of the vision exposure concentrated where the model already speaks fluently. K2.5's authors push back on this directly.
+
+### Finding 1: early fusion at a *low* vision ratio wins
+
+The paper runs a controlled ablation: fix the total number of vision and text tokens, then sweep the **injection timing** (how early in pre-training vision shows up) and the **vision-to-text ratio**. The result, reproduced from Table 1 of the paper:
+
+| Injection | Vision-text ratio | Vision knowledge | Vision reasoning | OCR  | Text knowledge | Text reasoning | Code |
+|-----------|-------------------|------------------|------------------|------|----------------|----------------|------|
+| Early (0%)    | 10% : 90%        | **25.8**         | **43.8**         | **65.7** | **45.5**       | 58.5           | **24.8** |
+| Mid   (50%)   | 20% : 80%        | 25.0             | 40.7             | 64.1 | 43.9           | **58.6**       | 24.0     |
+| Late  (80%)   | 50% : 50%        | 24.2             | 39.0             | 61.5 | 43.1           | 57.8           | 24.0     |
+
+The "Early" row introduces vision tokens from the start at a modest 10% mix. It wins on essentially every metric — vision *and* text. Concentrating vision at the end with a high ratio is the worst configuration on both axes.
+
+The way to read this: vision and text aren't competing for capacity, they're co-developing representations. If you wait until late to show the model images, the text-only representations are already "set" and have to be partially overwritten — which costs text quality without buying much vision quality. If you mix from day one, the model builds representations that are jointly grounded in both modalities, and a small steady drip of vision tokens is enough to keep the visual side learning.
+
+K2.5 trains on **~15T mixed visual + text tokens** with a constant ratio throughout. No separate "vision stage."
+
+### Architectural pieces: MoonViT-3D and NaViT packing
+
+To make early fusion practical at scale, the vision encoder has to handle real-world image and video inputs without forcing everything into a fixed grid. Two design choices matter here:
+
+- **NaViT packing.** Traditional ViTs require all images in a batch to be resized to a fixed resolution, which throws away information for tall/wide images and wastes compute on small ones. NaViT (Dehghani et al., 2023) instead "packs" patches from many variable-resolution images into a single sequence — like how language models pack documents of different lengths into a batch. MoonViT-3D inherits this.
+
+- **3D ViT compression for video.** Frames are grouped in fours; each group is processed by the shared MoonViT and then **temporally averaged at the patch level**. The image and video encoders share weights completely, and a clip fits in 4× less context than the naive frame-by-frame encoding.
+
+Both choices keep the vision input flexible (variable resolution, variable temporal length) while letting the same encoder serve images and video — important because the joint pre-training mixture spans both.
+
+### Finding 2: zero-vision SFT
+
+After pre-training comes supervised fine-tuning to elicit specific behaviors — in K2.5's case, *visual tool use*. A model that can describe an image is not the same as a model that can call a `crop` or `OCR` tool in the middle of solving a problem.
+
+The conventional fix is to hand-author visual chain-of-thought trajectories: a person writes out a reasoning trace that calls vision tools at the right points, and you SFT on that. The trouble is that high-quality visual CoT data is scarce, expensive, and tends to cover a narrow set of simple operations (crop, rotate, flip on toy diagrams).
+
+K2.5's surprise: you don't need any of it. They run **zero-vision SFT** — SFT on *text-only* trajectories — and the model picks up vision tool use anyway. The trick is that "vision tools" are exposed as **programmatic operations in IPython**. The model is taught (on text problems) how to manipulate arrays, slice tensors, do counting via binarization, run small image-processing snippets — all on synthetic or text-described inputs. Because text SFT data is abundant and diverse, the model learns a much richer repertoire of operations than hand-written visual CoT could ever supply.
+
+When this same model is shown a real image at inference time, the joint pre-training has already aligned visual patches with the same code-space the SFT taught it to operate in. The behavior generalizes. The paper notes that mixing visual SFT data *in* at this stage actually hurts — likely because the few visual trajectories available are narrow enough to be a regression on the broader text distribution.
+
+This is the cleanest example in the paper of "joint pre-training does the heavy lifting" — because text and vision were co-developed, an SFT phase in one modality propagates to the other.
+
+### Finding 3: visual RL improves *text* benchmarks
+
+The final post-training stage is outcome-based RL with verifiable rewards. K2.5 runs RL on three families of vision tasks:
+
+1. **Visual grounding and counting** — localize and enumerate objects in an image.
+2. **Chart and document understanding** — read structured visual content, extract text.
+3. **Vision-critical STEM** — math/science problems that *require* an image to solve.
+
+After this vision-only RL phase, they evaluate text-only benchmarks. The expected outcome would be flat (best case) or slightly worse (you've spent capacity on vision). What actually happens:
+
+| Benchmark      | Before vision RL | After vision RL | Δ      |
+|----------------|------------------|-----------------|--------|
+| MMLU-Pro       | 84.7             | 86.4            | +1.7   |
+| GPQA-Diamond   | 84.3             | 86.4            | +2.1   |
+| LongBench v2   | 56.7             | 58.9            | +2.2   |
+
+Text-only scores improve. The paper's interpretation: vision RL teaches the model better **calibration on structured information extraction** — counting, OCR, chart reading — and that calibration transfers to text questions with similar shape (table-heavy MMLU-Pro items, long-document LongBench tasks).
+
+This motivates the final architectural call: the production RL stage isn't divided by modality but **by ability** — knowledge, reasoning, coding, agentic. Each ability-expert sees both text and multimodal queries; a single generative reward model scores both. Because the pre-training and SFT pipelines already produced a unified representation, the RL framework can stop pretending text and vision are separate problems.
+
+### Putting the joint story together
+
+Read these three findings end to end and a clean picture emerges:
+
+1. **Early, low-ratio vision fusion in pre-training** builds a representation where text and vision share the same substrate.
+2. **Zero-vision SFT** exploits that shared substrate — text-only trajectories activate visual tool use because the model already knows that "a region of pixels" and "a region of a tensor in code" are the same thing.
+3. **Joint RL** is the payoff: improvements on vision tasks transfer to text and vice versa, with no measurable degradation in either direction.
+
+The headline isn't any single trick — it's that the three stages are designed to be self-reinforcing. Each one's effectiveness depends on the previous one having committed to joint representation rather than modality-as-add-on.
+
+## Part 2 — Agent Swarm: parallel orchestration learned via RL
+
+### The sequential bottleneck
+
+By 2026 the strongest agents — Claude Opus 4.5, Kimi K2-Thinking, GPT-5.2 — can chain hundreds of reasoning-plus-tool-call steps. That depth is impressive, but it comes from **sequential execution**: think, call tool, observe, think, call tool, observe. Latency is linear in step count, and each new step has to fit inside a growing context window. For "build me a complex project" — wide research, design, parallel implementation — sequential agents hit a wall.
+
+The obvious response is parallelism, and the obvious version of that response is hand-coded: a hard-wired planner that splits the task by a heuristic and spawns workers. K2.5 argues that's exactly the wrong solution, because *whether and how to parallelize is itself a learned skill*. Different tasks need different splits, and the model should be the one deciding.
+
+### The Agent Swarm shape
+
+Agent Swarm has a deliberately simple structure: a single **trainable orchestrator** and a population of **frozen subagents** instantiated from earlier policy checkpoints. The orchestrator dynamically decomposes the user task, spawns subagents, runs them in parallel, and aggregates their outputs. Subagents are not retrained jointly with the orchestrator — their outputs are treated as **environment observations**, indistinguishable from a tool call returning a result.
+
+Two reasons for the decoupling:
+
+- **Credit assignment.** In multi-agent RL, a failed task could be the orchestrator's fault (bad decomposition) or a subagent's (bad execution). Trying to assign blame across both with one outcome reward is notoriously unstable. Freezing subagents collapses the problem to single-agent RL on the orchestrator.
+- **Training stability.** Co-optimizing many policies that all condition on each other's outputs creates a non-stationary environment. Freezing one side fixes the distribution.
+
+Practical efficiency tricks: train the orchestrator first with **small subagents**, then swap in larger ones once the high-level coordination has stabilized. The training framework also tunes the ratio of orchestrator vs. subagent inference instances dynamically, since rollouts under-utilize the cluster if you assume a fixed ratio.
+
+### PARL: the reward function
+
+Naively rewarding only the final task outcome leads to two pathologies:
+
+- **Serial collapse.** The orchestrator learns that spawning subagents is risky (they sometimes fail) and degenerates into a single sequential agent — exactly what Agent Swarm is supposed to replace.
+- **Spurious parallelism.** The orchestrator learns to spawn many subagents to game any parallelism-related metric, without producing meaningful decompositions, and the subagents do useless work.
+
+The Parallel Agent RL (PARL) reward combats both with two auxiliary terms:
+
+$$
+r_{\mathrm{PARL}}(x, y) = \lambda_1 \cdot r_{\text{parallel}} + \lambda_2 \cdot r_{\text{finish}} + r_{\text{perf}}(x, y).
+$$
+
+- $r_{\text{perf}}$ — task-level outcome reward. The primary signal.
+- $r_{\text{parallel}}$ — rewards subagent instantiation. Pushes the policy out of serial collapse by making "try a parallel decomposition" worth a small bonus even when uncertain.
+- $r_{\text{finish}}$ — rewards subagents *actually completing* their assigned subtasks. Prevents reward-hacking via spurious parallelism: a swarm of failing subagents earns nothing from this term.
+
+Both $\lambda_1$ and $\lambda_2$ are **annealed to zero** over training. Early on, the auxiliary terms shape exploration toward parallel structure; late in training, they fade and the policy is judged purely on outcomes. The auxiliary rewards are scaffolding, not the goal.
+
+### Critical steps: making latency the resource
+
+The standard RL resource constraint for agents is *total steps* — sum of all tool calls across all agents. That's the right metric for a sequential agent, but it actively *penalizes* parallelism: spawning four subagents that each take five steps costs 20, even though wallclock-wise they finish in five.
+
+K2.5 redefines the constraint as **critical steps**, borrowed from the *critical path* in a compute graph. For an episode with stages $t = 1, \dots, T$:
+
+$$
+\text{CriticalSteps} = \sum_{t=1}^{T} \left( S_{\mathrm{main}}^{(t)} + \max_i S_{\mathrm{sub}, i}^{(t)} \right).
+$$
+
+Within a stage, the orchestrator pays the cost of its own step plus **only the longest subagent's step count** — the others run in parallel and are free. This metric:
+
+- Rewards balanced decomposition. Splitting a task into four 5-step subagents costs 5 critical steps; splitting into one 20-step subagent and three 1-step subagents costs 20.
+- Penalizes spurious parallelism. Spawning subagents that don't shorten the longest branch buys nothing under this metric.
+- Aligns the training objective with what users actually experience — end-to-end latency.
+
+### Inducing parallel behavior via prompts
+
+A trainable orchestrator needs *training data that rewards parallel decomposition*. If every prompt can be solved in 30 sequential steps, the orchestrator never has a reason to split. K2.5 builds a synthetic prompt suite designed to be infeasible-within-budget for a sequential agent. Two flavors:
+
+- **Wide search.** Tasks requiring simultaneous exploration of many independent information sources — "for each of these 50 companies, find X."
+- **Deep search.** Tasks requiring multiple reasoning branches with delayed aggregation — explore several hypotheses, then synthesize.
+
+Plus real-world workloads: long-context document analysis, large-scale file downloading. Critically, the prompts **do not instruct the model to parallelize**. They simply create distributions where parallel decomposition is the only way to fit within the budget. The orchestrator discovers parallelism because the environment forces it to.
+
+### The result
+
+The paper reports that in wide-search scenarios, Agent Swarm cuts inference latency by up to **4.5×** while *improving* item-level F1 from 72.8% to 79.0% versus a single-agent baseline. Latency drops because parallel execution shortens the critical path; quality goes up because each subagent has a focused context window instead of a single agent juggling everything in one growing scratchpad.
+
+This matters more than the headline numbers, because the takeaway is structural: as long-horizon agentic workloads grow, a model whose coordination is itself a learned skill scales differently from one whose coordination is sequential by default.
+
+## Closing thoughts
+
+The two halves of this paper rhyme more than they look like at first.
+
+In the multimodal half, the bet is that **representations co-developed across modalities transfer skills across modalities** — that's why text SFT activates vision tool use, and why vision RL improves text benchmarks. Modalities aren't separate problems with shared infrastructure; they're the same problem with different surface forms.
+
+In the agentic half, the bet is that **coordination is itself a learnable policy, not a hard-coded scaffold** — that's why PARL trains an orchestrator with RL instead of writing a planner, and why critical steps replace total steps as the resource constraint. Agent topology isn't separate from agent capability; it's the same problem at a higher level.
+
+Both bets are versions of the same wager: *don't pre-commit the structure*. Let pre-training, SFT, and RL discover the right cross-modal substrate and the right parallel decomposition jointly, rather than baking either in by hand. Whether that wager keeps paying off as agentic systems grow is the question the next round of frontier models will answer.

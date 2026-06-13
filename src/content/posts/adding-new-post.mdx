@@ -25,13 +25,19 @@ This guide covers the rules and conventions for creating new posts in AstroPaper
   </figcaption>
 </figure>
 
-## Table of contents
-
 ## Creating a Blog Post
 
-To write a new blog post, create a markdown (or MDX) file inside the `src/content/posts/` directory.
+To write a new blog post, create a markdown (or MDX) file inside the `src/content/posts/` directory. Here I am just testing[^1] the new footnote.
+
+[^1]: The footnote body. Supports **inline markdown**, links, etc.
 
 You can organize posts into subdirectories to make content easier to manage. The subdirectory name becomes part of the post URL. For example, `src/content/posts/2025/example-post.md` will be available at `/posts/2025/example-post`.
+
+
+<details>
+<summary>Custom heading</summary>  
+Content to collapse...  
+</details>
 
 If you want a subdirectory for organization only, without it affecting the URL, prefix the folder name with an underscore (`_`).
 
@@ -48,7 +54,9 @@ src/content/posts/Example Dir/Dummy Post.md   -> mysite.com/posts/example-dir/du
 
 ## Frontmatter
 
-Frontmatter is the main place to store metadata about a blog post. It lives at the top of the file in YAML format. Read more about frontmatter and its usage in [Astro documentation](https://docs.astro.build/en/guides/markdown-content/).
+Frontmatter is the main place to store metadata about a blog post.
+:aside[This is testing paragraph level floating note.]
+It lives at the top of the file in YAML format. Read more about frontmatter and its usage in [Astro documentation](https://docs.astro.build/en/guides/markdown-content/).
 
 Here is the list of frontmatter properties for each post:
 
@@ -112,26 +120,24 @@ canonicalURL: https://example.org/my-article-was-already-posted-here
 AstroPaper includes workspace snippets to speed up creating new posts:
 
 - **frontmatter**: inserts the recommended frontmatter block
-- **template**: inserts a basic post template (including `## Table of contents`)
+- **template**: inserts a basic post template
 
-These snippets live in `.vscode/astro-paper.code-snippets`. If you use VS Code (or Cursor), they should be available automatically when you open the workspace.
+These snippets live in `.vscode/astro-paper.code-snippets`.
+
+:::aside
+This is testing **block-level** floating note. It can contain rich
+markdown — `code`, [links](https://example.com), and multiple paragraphs.
+
+These snippets live in `.vscode/astro-paper.code-snippets`. If you use VS Code...
+:::
+
+If you use VS Code (or Cursor), they should be available automatically when you open the workspace.
 
 ## Adding table of contents
 
-By default, a post does not include any table of contents (TOC). To include one, write `Table of contents` as an h2 heading (`##` in Markdown) and place it where you want it to appear:
+AstroPaper automatically builds a table of contents from the post headings and displays it in a sticky left rail on desktop-width screens. The rail is hidden on smaller screens to keep the reading column focused.
 
-```md
----
-# frontmatter
----
-
-Here are some recommendations, tips & tricks for creating new posts in AstroPaper blog theme.
-
-<!-- [!code ++] -->
-## Table of contents
-
-<!-- the rest of the post -->
-```
+You do not need to add a `## Table of contents` heading. Use normal `h2` through `h4` headings in the post body and AstroPaper will include them automatically.
 
 ## Headings
 
@@ -159,7 +165,7 @@ import {
 export default defineConfig({
   // ...
   markdown: {
-    remarkPlugins: [remarkToc, [remarkCollapse, { test: "Table of contents" }]],
+    remarkPlugins: [remarkMath],
     shikiConfig: {
       themes: { light: "min-light", dark: "night-owl" },
       defaultColor: false,

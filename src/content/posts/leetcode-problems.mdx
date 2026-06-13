@@ -1,0 +1,3206 @@
+---
+title: "Leetcode Problems"
+slug: "leetcode-problems"
+pubDatetime: 2026-05-26T14:31:00.000Z
+description: "Leetcode grinding."
+---
+
+## Table of contents
+
+## Backtracking
+
+General template:
+
+```python
+result = []
+def backtrack(path, choices):
+    if satisfies end condition:
+        result.add(path)
+        return
+
+    for choice in choices:
+        make the choice
+        backtrack(path, choices)
+        withdraw the choice
+```
+
+Example — Permutations using backtrack:
+
+```python
+def permute(nums: list[int]) -> list[list[int]]:
+    ans = []
+    track = []
+    used = [False] * len(nums)
+
+    def backtrack(nums, track, used):
+        if len(track) == len(nums):
+            # NOTE: use copy here
+            ans.append(track.copy())
+        for i, num in enumerate(nums):
+            if used[i]:
+                continue
+            track.append(num)
+            used[i] = True
+            backtrack(nums, track, used)
+            track.pop()
+            used[i] = False
+
+    backtrack(nums, track, used)
+    return ans
+```
+
+> Since lists are mutable in Python, when we append a `track` to result list, avoid appending a reference to the same list `track` by enforcing a deepcopy with `track[:]` or `track.copy()`. Otherwise, when `track` is modified in subsequent iterations, it also changes the list in `ans`.
+
+### 1849. Splitting a String Into Descending Consecutive Values
+
+[Leetcode](https://leetcode.com/problems/splitting-a-string-into-descending-consecutive-values/description)
+
+You are given a string `s` that consists of only digits.
+
+Check if we can split `s` into two or more non-empty substrings such that the numerical values of the substrings are in descending order and the difference between numerical values of every two adjacent substrings is equal to 1.
+
+For example, the string `s = "0090089"` can be split into `["0090", "089"]` with numerical values `[90,89]`. The values are in descending order and adjacent values differ by 1, so this way is valid.
+Another example, the string `s = "001"` can be split into `["0", "01"]`, `["00", "1"]`, or `["0", "0", "1"]`. However all the ways are invalid because they have numerical values `[0,1]`, `[0,1]`, and `[0,0,1]` respectively, all of which are not in descending order.
+Return `true` if it is possible to split `s` as described above, or `false` otherwise.
+
+A substring is a contiguous sequence of characters in a string.
+
+```
+Example 1:
+Input: s = "1234"
+Output: false
+
+Example 2:
+Input: s = "050043"
+Output: true
+Explanation: s can be split into ["05", "004", "3"] with numerical values [5,4,3].
+
+Example 3:
+Input: s = "9080701"
+Output: false
+
+Constraints:
+1 <= s.length <= 20
+s only consists of digits.
+```
+
+<details>
+<summary>Hint</summary>Try every possible first number, then each next piece is forced to be exactly previous minus one; leading zeros are allowed in substrings.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use backtracking: at each starting position, try every prefix as the next chunk. A chunk is acceptable only when the track is empty, or the previous chunk's numerical value is exactly one greater than the current chunk's. Track success when the entire string is consumed and we made at least two splits.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = False
+
+    def backtrack(self, s, track, start):
+        if start == len(s) and len(track) > 1:
+            self.ans = True
+            return
+
+        for i in range(start, len(s)):
+            if len(track) == 0 or int(track[-1]) - int(s[start:i+1]) == 1:
+                track.append(s[start:i+1])
+                self.backtrack(s, track, i+1)
+                track.pop()
+
+    def splitString(self, s: str) -> bool:
+        self.backtrack(s, [], 0)
+        return self.ans
+```
+
+## BFS
+
+### 662. Maximum Width of Binary Tree
+
+[Leetcode](https://leetcode.com/problems/maximum-width-of-binary-tree/description)
+
+Given the root of a binary tree, return the maximum width among all levels. The width counts the null gaps between the leftmost and rightmost non-null nodes as if the tree were a complete binary tree.
+
+```
+Example 1:
+Input: root = [1,3,2,5,3,null,9]
+Output: 4
+Explanation: The last level spans positions [5,3,null,9].
+
+Example 2:
+Input: root = [1,3,2,5]
+Output: 2
+```
+
+
+<details>
+<summary>Hint</summary>
+Pretend the tree is stored in an array and assign each node its complete-tree index.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+
+The core idea is the following:
+
+- If a node is at index $i$:
+  - Its left child would be at index $2i + 1$ (if root is 0-indexed) or $2i$ (if root is 1-indexed).
+  - Its right child would be at index $2i + 2$ (if root is 0-indexed) or $2i + 1$ (if root is 1-indexed).
+
+Normalize the index per level to prevent overflow for very deep trees by re-basing the level's indices so that the first node has an effective index of 0.
+
+**Solution 2:** DFS while tracking the leftmost node at each depth in a list. The first time we visit a depth, we record the index — that's the leftmost. Subsequent visits at the same depth update `maxWidth`.
+
+</details>
+
+```py
+from collections import deque
+
+class Solution:
+    def widthOfBinaryTree(self, root) -> int:
+        if root is None:
+            return 0
+
+        ans = 1
+        dq = deque()
+        dq.append((root, 1))
+        
+        while dq:
+            sz = len(dq)
+            cur_first_index = None
+            for _ in range(sz):
+                node, index = dq.popleft()
+                if cur_first_index is None:
+                    cur_first_index = index
+                else:
+                    ans = max(ans, index-cur_first_index+1)
+                if node.left:
+                    dq.append((node.left, index*2))
+                if node.right:
+                    dq.append((node.right, index*2+1))
+
+        return ans
+```
+
+```py
+from collections import deque
+
+class ListNode:
+    def __init__(self, val):
+        self.val = val
+        self.left = None
+        self.right = None
+
+class Solution:
+    def maxWidth(self, root):
+        if root is None:
+            return
+        max_width = 1 # initialize width to 1 when root is not null
+
+        dq = deque()
+        dq.append((root, 0)) # (ListNode, level)
+        while dq:
+            sz = len(dq)
+            first_node_index_on_level = dq[0][1] 
+
+            leftmost_index_on_level = -1
+            rightmost_index_on_level = -1
+
+            for i in range(sz):
+                node, idx = dq.popleft()
+                if i == 0: # leftmost node on the level
+                    leftmost_index_on_level = idx
+                rightmost_index_on_level = idx
+
+                # Normalize the index to prevent overflow for very deep trees.
+                # This effectively re-bases the current level's indices so that
+                # the first node has an effective index of 0 on that level.
+                if node.left:
+                    dq.append((node.left, (idx - first_node_index_on_level) * 2))
+                if node.right:
+                    dq.append((node.right, (idx - first_node_index_on_level) * 2 + 1))
+
+            current_level_width = rightmost_index_on_level - leftmost_index_on_level + 1
+            max_width = max(max_width, current_level_width)
+
+        return max_width
+```
+
+Solution 2 — DFS:
+
+```python
+class Solution:
+    def __init__(self):
+        self.firstIds = []
+        self.maxWidth = 1
+
+    def dfs(self, root, index, depth):
+        if root is None:
+            return
+
+        # It means we've never been to this level before,
+        # which means we are at the leftmost node due to the nature of DFS
+        if depth == len(self.firstIds):
+            self.firstIds.append(index)
+        else:
+            self.maxWidth = max(self.maxWidth, index - self.firstIds[depth] + 1)
+
+        self.dfs(root.left, index*2, depth+1)
+        self.dfs(root.right, index*2+1, depth+1)
+
+    def widthOfBinaryTree(self, root) -> int:
+        if root is None:
+            return 0
+
+        # Start at root: index 1, depth 0
+        self.dfs(root, 1, 0)
+
+        return self.maxWidth
+```
+
+### 958. Check Completeness of a Binary Tree
+
+<details>
+<summary>Approach</summary>
+
+Key idea: in a complete binary tree, after the first missing child/null appears in level-order traversal, no real node may appear afterward.
+
+</details>
+
+```python
+from collections import deque
+
+class Solution:
+    def isCompleteTree(self, root: Optional[TreeNode]) -> bool:
+        if root is None:
+            return False
+
+        dq = deque()
+        dq.append(root)
+        seen_null = False
+
+        while dq:
+            sz = len(dq)
+            for _ in range(sz):
+                node = dq.popleft()
+
+                # Tag null node
+                if node is None:
+                    seen_null = True
+                else:
+                    # A real node is visited after an null node at the same level: not a complete tree
+                    if seen_null:
+                        return False
+                    dq.append(node.left)
+                    dq.append(node.right)
+        return True
+```
+
+### 863. All Nodes Distance K in Binary Tree
+
+<details>
+<summary>Approach:</summary>
+
+Build a undirected graph using DFS, and the problem becomes finding all nodes distance K in the graph.
+
+</details>
+
+```py
+from collections import defaultdict, deque
+
+class Solution:
+    def __init__(self):
+        self.graph = defaultdict(list)
+
+    # Build graph
+    def dfs(self, root):
+        if root is None:
+            return
+        if root.left:
+            self.graph[root].append(root.left)
+            self.graph[root.left].append(root)
+            self.dfs(root.left)
+        if root.right:
+            self.graph[root].append(root.right)
+            self.graph[root.right].append(root)
+            self.dfs(root.right)
+
+    def distanceK(self, root: TreeNode, target: TreeNode, k: int) -> List[int]:
+        self.dfs(root)
+
+        dq = deque()
+        dq.append((target, 0))
+        visited = set({target})
+        ans = []
+
+        while dq:
+            sz = len(dq)
+            for _ in range(sz):
+                node, dist = dq.popleft()
+                if dist == k:
+                    ans.append(node.val)
+
+                for neighbor in self.graph[node]:
+                    if neighbor not in visited:
+                        dq.append((neighbor, dist+1))
+                        visited.add(neighbor)
+
+        return ans
+```
+
+
+### 1091. Shortest Path in Binary Matrix
+
+[Leetcode](https://leetcode.com/problems/shortest-path-in-binary-matrix/description)
+
+Given an `n x n` binary matrix `grid`, return the length of the shortest clear path from the top-left cell to the bottom-right cell. A clear path may move in 8 directions and can only pass through cells with value `0`. Return `-1` if no such path exists.
+
+```
+Example 1:
+Input: grid = [[0,1],[1,0]]
+Output: 2
+
+Example 2:
+Input: grid = [[0,0,0],[1,1,0],[1,1,0]]
+Output: 4
+```
+
+
+<details>
+<summary>Hint</summary>
+Because all moves cost 1, BFS is the right shortest-path algorithm.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use BFS from `(0, 0)` because every move has equal cost. Push all valid unvisited 8-direction neighbors with distance `cur + 1`; the first time we pop the bottom-right cell is the shortest path.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = 200
+        self.directions = (
+            (0,1),(0,-1),(1,0),(-1,0),
+            (1,1),(1,-1),(-1,1),(-1,-1)
+        )
+
+    def valid_index(self, n, i, j):
+        return 0 <= i < n and 0 <= j < n
+
+    def shortestPath(self, grid):
+        n = len(grid)
+        if grid[0][0] != 0 or grid[n-1][n-1] != 0:
+            return -1
+
+        dq = deque()
+        dq.append((0, 0, 1))
+        visited = set([(0, 0)])
+
+        while dq:
+            sz = len(dq)
+            for _ in range(sz):
+                i, j, cur_len = dq.popleft()
+                if i == n-1 and j == n-1:
+                    return cur_len
+
+                for di, dj in self.directions:
+                    if not self.valid_index(n, i+di, j+dj):
+                        continue
+                    if (i+di, j+dj) in visited:
+                        continue
+                    if grid[i+di][j+dj] != 0:
+                        continue
+                    visited.add((i, j))
+                    dq.append((i+di, j+dj, cur_len+1))
+
+        return -1
+```
+
+### 721. Accounts Merge
+
+[Leetcode](https://leetcode.com/problems/accounts-merge/description)
+
+Given a list of accounts where each element `accounts[i]` is a list of strings, where the first element `accounts[i][0]` is a name, and the rest of the elements are emails representing emails of the account.
+
+Now, we would like to merge these accounts. Two accounts definitely belong to the same person if there is some common email to both accounts. Note that even if two accounts have the same name, they may belong to different people as people could have the same name. A person can have any number of accounts initially, but all of their accounts definitely have the same name.
+
+After merging the accounts, return the accounts in the following format: the first element of each account is the name, and the rest of the elements are emails in sorted order. The accounts themselves can be returned in any order.
+
+```
+Example 1:
+Input: accounts = [["John","johnsmith@mail.com","john_newyork@mail.com"],["John","johnsmith@mail.com","john00@mail.com"],["Mary","mary@mail.com"],["John","johnnybravo@mail.com"]]
+Output: [["John","john00@mail.com","john_newyork@mail.com","johnsmith@mail.com"],["Mary","mary@mail.com"],["John","johnnybravo@mail.com"]]
+```
+
+<details>
+<summary>Hint</summary>
+Treat each email as a node and connect emails that appear in the same account; merged accounts are the connected components of that graph.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Build an undirected graph where nodes are emails. For each account, connect the first email with each other email. Map each email to its name. Then BFS from each unvisited email and gather connected components — each component, prefixed with its name and sorted, is one merged account. Iterate over `email_to_name` rather than the graph keys to avoid missing isolated emails.
+</details>
+
+```python
+from collections import defaultdict, deque
+
+class Solution:
+    def accountsMerge(self, accounts):
+        graph: dict[str, set[str]] = defaultdict(set)
+        email_to_name: dict[str, str] = dict()
+
+        for account in accounts:
+            name = account[0]
+            first_email = account[1]
+            email_to_name[first_email] = name
+
+            for i in range(2, len(account)):
+                current_email = account[i]
+                email_to_name[current_email] = name
+                graph[first_email].add(current_email)
+                graph[current_email].add(first_email)
+
+        result = []
+
+        visited = set()
+        for email in email_to_name:
+            if email in visited:
+                continue
+            current_account_emails = []
+            queue = deque()
+            queue.append(email)
+            visited.add(email)
+
+            while queue:
+                cur_email = queue.popleft()
+                current_account_emails.append(cur_email)
+
+                for neighbor_email in graph[cur_email]:
+                    if neighbor_email not in visited:
+                        visited.add(neighbor_email)
+                        queue.append(neighbor_email)
+
+            current_account_emails.sort()
+            result.append([email_to_name[email], *current_account_emails])
+
+        return result
+```
+
+### 994. Rotting Oranges
+
+[Leetcode](https://leetcode.com/problems/rotting-oranges/description)
+
+Given a grid where `0` is empty, `1` is a fresh orange, and `2` is a rotten orange, every minute each rotten orange rots adjacent fresh oranges in the four cardinal directions. Return the minimum minutes until no fresh orange remains, or `-1` if impossible.
+
+```
+Example 1:
+Input: grid = [[2,1,1],[1,1,0],[0,1,1]]
+Output: 4
+
+Example 2:
+Input: grid = [[2,1,1],[0,1,1],[1,0,1]]
+Output: -1
+```
+
+
+<details>
+<summary>Hint</summary>
+Start BFS from every rotten orange at once; each BFS layer is one minute.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+This is multi-source BFS. Put all initially rotten oranges in the queue, count fresh oranges, then process the queue level by level; each level represents one minute of rotting.
+</details>
+
+```python
+from collections import deque
+
+class Solution:
+    def orangesRotting(self, grid: List[List[int]]) -> int:
+        m = len(grid)
+        n = len(grid[0])
+        num_fresh = 0
+        ans = 0  # final answer: number of minutes
+        q = deque()
+        directions = [[0, 1], [1, 0], [0, -1], [-1, 0]]
+
+        for i in range(m):
+            for j in range(n):
+                if grid[i][j] == 1:
+                    num_fresh += 1
+                if grid[i][j] == 2:
+                    q.append((i, j, 0))
+
+        while q:
+            i, j, minute = q.popleft()
+            ans = max(ans, minute)
+            for di, dj in directions:
+                ni, nj = i + di, j + dj
+                if 0 <= ni < m and 0 <= nj < n and grid[ni][nj] == 1:
+                    grid[ni][nj] = 2
+                    q.append((ni, nj, minute + 1))
+                    num_fresh -= 1
+
+        return ans if num_fresh == 0 else -1
+```
+
+Alternative — track minutes by BFS levels:
+
+```python
+class Solution:
+    def __init__(self):
+        self.minutes = 0
+        self.healthy = 0
+        self.directions = ((0, 1), (0, -1), (1, 0), (-1, 0))
+
+    def bfs(self, grid, m, n):
+        dq = deque()
+        dq.append((0, 0))
+
+        while dq:
+            if self.healthy <= 0:
+                return
+            sz = len(dq)
+            for _ in range(sz):
+                i, j = dq.popleft()
+                if grid[i][j] != 2:
+                    continue
+                for di, dj in self.directions:
+                    if 0 <= i+di < m and 0 <= j+dj < n and grid[i+di][j+dj] == 1:
+                        grid[i+di][j+dj] = 2
+                        self.healthy -= 1
+                        dq.append((i+di, j+dj))
+            self.minutes += 1
+
+    def orangesRotting(self, grid: List[List[int]]) -> int:
+        m, n = len(grid), len(grid[0])
+        for i in range(m):
+            for j in range(n):
+                if grid[i][j] == 1:
+                    self.healthy += 1
+        self.bfs(grid, m, n)
+        if self.healthy > 0:
+            return -1
+        return self.minutes
+```
+
+## Binary Search
+
+Templates for finding the left/right boundary of a target in a sorted array:
+
+```python
+def findLeftBoundary(self, nums, target):
+    if len(nums) == 0:
+        return -1
+
+    l, r = 0, len(nums) - 1
+    ans = -1
+
+    while l <= r:
+        mid = (l + r) // 2
+        if nums[mid] < target:
+            l = mid + 1
+        elif nums[mid] == target:
+            ans = mid
+            r = mid - 1
+        elif nums[mid] > target:
+            r = mid - 1
+
+    return ans if ans != -1 else -1
+```
+
+```python
+def findRightBoundary(self, nums, target):
+    if len(nums) == 0:
+        return -1
+
+    l, r = 0, len(nums) - 1
+    ans = -1
+
+    while l <= r:
+        mid = (l + r) // 2
+        if nums[mid] < target:
+            l = mid + 1
+        elif nums[mid] == target:
+            ans = mid
+            l = mid + 1
+        elif nums[mid] > target:
+            r = mid - 1
+
+    return ans if ans != -1 else -1
+```
+
+## Binary Tree
+
+> Unless specified otherwise, the tree node used in the following problems is defined as:
+>
+> ```python
+> class TreeNode:
+>     def __init__(self, val=None, left=None, right=None):
+>         self.val = val
+>         self.left = left
+>         self.right = right
+> ```
+
+### 257. Binary Tree Paths
+
+[Leetcode](https://leetcode.com/problems/binary-tree-paths/description)
+
+Given the root of a binary tree, return all root-to-leaf paths as strings using `->` between node values.
+
+```
+Example 1:
+Input: root = [1,2,3,null,5]
+Output: ["1->2->5","1->3"]
+
+Example 2:
+Input: root = [1]
+Output: ["1"]
+```
+
+
+<details>
+<summary>Hint</summary>
+A path is complete only at a leaf; carry the string/list along the recursive call.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Two equivalent traversals: backtracking with an explicit visited set, or plain DFS that just appends to a string on the way down and records the path at every leaf.
+</details>
+
+Solution 1 — backtracking:
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def backtrack(self, root, track: str, visited):
+        if root.left is None and root.right is None:
+            self.ans.append(track)
+            return
+
+        if root.left is not None:
+            visited.add(root.left)
+            old_track = track
+            track = track + "->" + str(root.left.val)
+            self.backtrack(root.left, track, visited)
+            track = old_track
+            visited.remove(root.left)
+
+        if root.right is not None:
+            visited.add(root.right)
+            old_track = track
+            track = track + "->" + str(root.right.val)
+            self.backtrack(root.right, track, visited)
+            track = old_track
+            visited.remove(root.right)
+
+    def binaryTreePaths(self, root) -> list[str]:
+        if root is None:
+            return self.ans
+        self.backtrack(root, str(root.val), set([root]))
+        return self.ans
+```
+
+Solution 2 — DFS:
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, root, track: str):
+        if root is None:
+            return
+
+        if track:
+            track = track + "->" + str(root.val)
+        else:
+            track = str(root.val)
+
+        if root.left is None and root.right is None:
+            self.ans.append(track)
+            return
+
+        if root.left:
+            self.dfs(root.left, track)
+        if root.right:
+            self.dfs(root.right, track)
+
+    def binaryTreePaths(self, root) -> list[str]:
+        if root is None:
+            return self.ans
+        self.dfs(root, "")
+        return self.ans
+```
+
+### 129. Sum Root to Leaf Numbers
+
+[Leetcode](https://leetcode.com/problems/sum-root-to-leaf-numbers/description)
+
+Each root-to-leaf path in a binary tree represents a number formed by concatenating node digits. Return the sum of all such numbers.
+
+```
+Example 1:
+Input: root = [1,2,3]
+Output: 25
+Explanation: 12 + 13 = 25.
+
+Example 2:
+Input: root = [4,9,0,5,1]
+Output: 1026
+```
+
+
+<details>
+<summary>Hint</summary>
+Appending a digit to a number is `num * 10 + digit`.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Do DFS carrying the number formed so far. At each node update `current = current * 10 + node.val`; when a leaf is reached, add `current` to the answer.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = 0
+
+    def dfs(self, root, track):
+        if root is None:
+            return
+
+        track = track * 10 + root.val
+        if root.left is None and root.right is None:
+            self.ans += track
+            return
+
+        if root.left:
+            self.dfs(root.left, track)
+        if root.right:
+            self.dfs(root.right, track)
+
+    def sumNumbers(self, root: Optional[TreeNode]) -> int:
+        self.dfs(root, 0)
+        return self.ans
+```
+
+
+
+### 199. Binary Tree Right Side View
+
+[Leetcode](https://leetcode.com/problems/binary-tree-right-side-view/description)
+
+Given the root of a binary tree, return the values visible when looking at the tree from the right side, ordered from top to bottom.
+
+```
+Example 1:
+Input: root = [1,2,3,null,5,null,4]
+Output: [1,3,4]
+
+Example 2:
+Input: root = [1,null,3]
+Output: [1,3]
+```
+
+
+<details>
+<summary>Hint</summary>
+If you traverse right-child-first and track depth, the first node you visit at each new depth is exactly the rightmost-visible one.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Traverse with DFS while tracking depth. Explore the right child first; the first time we hit a new depth, that node is the rightmost at that level.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, root, depth):
+        if root is None:
+            return
+
+        if depth == len(self.ans):
+            self.ans.append(root.val)
+
+        # Explore right child first
+        self.dfs(root.right, depth+1)
+        self.dfs(root.left, depth+1)
+
+    def rightSideView(self, root) -> list[int]:
+        self.dfs(root, 0)
+        return self.ans
+```
+
+## DFS
+
+### 46. Permutations
+
+[Leetcode](https://leetcode.com/problems/permutations/description)
+
+Given an array `nums` of distinct integers, return all possible permutations.
+
+```
+Example 1:
+Input: nums = [1,2,3]
+Output: [[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]]
+
+Example 2:
+Input: nums = [0,1]
+Output: [[0,1],[1,0]]
+```
+
+
+<details>
+<summary>Hint</summary>
+At each position, choose one unused number; append a copy of the track, not the mutable list itself.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Backtrack with a `track` list and a visited set/array. At each depth choose any unused number; when the track length equals `len(nums)`, append a copy to the answer.
+</details>
+
+```python
+class Solution():
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, nums, track, visited):
+        if len(track) == len(nums):
+            self.ans.append(track)
+            return
+
+        for i in range(len(nums)):
+            if nums[i] in visited:
+                continue
+            track.append(nums[i])
+            visited.add(nums[i])
+            self.dfs(nums, track[:], visited)
+            track.pop()
+            visited.remove(nums[i])
+
+    def permute(self, nums):
+        self.dfs(nums, [], set())
+        return self.ans
+```
+
+> Since lists are mutable in Python, when we append a `track` to result list, avoid appending a reference to the same list `track` by enforcing a deepcopy with `track[:]` or `track.copy()`.
+
+### 47. Permutations II
+
+[Leetcode](https://leetcode.com/problems/permutations-ii/description)
+
+Given a collection of numbers that may contain duplicates, return all unique permutations.
+
+```
+Example 1:
+Input: nums = [1,1,2]
+Output: [[1,1,2],[1,2,1],[2,1,1]]
+
+Example 2:
+Input: nums = [1,2,3]
+Output: [[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]]
+```
+
+
+<details>
+<summary>Hint</summary>
+Sort first, then skip a duplicate only when its previous copy was not used in the current branch.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Think of the binary tree that DFS traverses through. Take `nums = [1, 1, 2]` as an example. At level 0, the track can choose from the first 1 and 2. To prune branches choosing the second 1 at level 0, one might use `i > 0 and nums[i] == nums[i-1]`, but that prunes the second 1 at every level — losing valid permutations.
+
+The correct condition also requires that the first duplicate has not been used in the current track: `i > 0 and nums[i] == nums[i-1] and i-1 not in visited`. The same trick is used in *Combination Sum II*.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, nums, track, visited):
+        if len(track) == len(nums):
+            self.ans.append(track)
+            return
+
+        for i in range(len(nums)):
+            if i in visited:
+                continue
+            if i > 0 and nums[i] == nums[i-1] and i-1 not in visited:
+                continue
+            track.append(nums[i])
+            visited.add(i)
+            self.dfs(nums, track[:], visited)
+            track.pop()
+            visited.remove(i)
+
+    def permute(self, nums):
+        nums.sort()
+        self.dfs(nums, [], set())
+        return self.ans
+```
+
+### 77. Combinations
+
+[Leetcode](https://leetcode.com/problems/combinations/description)
+
+Given two integers `n` and `k`, return all possible combinations of `k` numbers chosen from the range `[1, n]`.
+
+```
+Example 1:
+Input: n = 4, k = 2
+Output: [[1,2],[1,3],[1,4],[2,3],[2,4],[3,4]]
+
+Example 2:
+Input: n = 1, k = 1
+Output: [[1]]
+```
+
+
+<details>
+<summary>Hint</summary>
+Use a start index so numbers are chosen in increasing order.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Backtrack over increasing choices. The `start` parameter ensures each combination is generated once and avoids permutations like `[2,1]` after `[1,2]`.
+</details>
+
+```python
+class Solution:
+    def combine(self, n: int, k: int) -> list[list[int]]:
+        ans = []
+
+        def dfs(track, start):
+            if len(track) == k:
+                ans.append(track[:])
+                return
+            for i in range(start, n + 1):
+                track.append(i)
+                dfs(track, i + 1)
+                track.pop()
+
+        dfs([], 1)
+        return ans
+```
+
+### 78. Subsets
+
+[Leetcode](https://leetcode.com/problems/subsets/description)
+
+Given an integer array `nums` with unique elements, return all possible subsets (the power set).
+
+```
+Example 1:
+Input: nums = [1,2,3]
+Output: [[],[1],[2],[1,2],[3],[1,3],[2,3],[1,2,3]]
+
+Example 2:
+Input: nums = [0]
+Output: [[],[0]]
+```
+
+
+<details>
+<summary>Hint</summary>
+Record the current track at every DFS node, not only at leaves.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use the array index `start` to track visited elements: `nums[:start]` are visited, `nums[start:]` are not.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, nums, stack: list, start: int):
+        self.ans.append(stack)
+        if start >= len(nums):
+            return
+
+        for i in range(start, len(nums)):
+            stack.append(nums[i])
+            self.dfs(nums, stack[:], i+1)
+            stack.pop()
+
+    def subset(self, nums):
+        self.dfs(nums, [], 0)
+        return self.ans
+```
+
+### 90. Subsets II
+
+[Leetcode](https://leetcode.com/problems/subsets-ii/description)
+
+Given an integer array `nums` that may contain duplicates, return all possible unique subsets.
+
+```
+Example 1:
+Input: nums = [1,2,2]
+Output: [[],[1],[1,2],[1,2,2],[2],[2,2]]
+
+Example 2:
+Input: nums = [0]
+Output: [[],[0]]
+```
+
+
+<details>
+<summary>Hint</summary>
+Sort first; skip `nums[i]` when it equals `nums[i-1]` and `i > start`.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+The array may contain duplicates. Duplicate subsets are not allowed but duplicate elements in the same subset are — `[1,2,2]` is fine. The pruning condition is `i > start and nums[i] == nums[i-1]`. Using `i > 0` instead of `i > start` over-prunes and gives a wrong answer like `[[], [1], [1, 2], [2]]`.
+</details>
+
+```python
+class Solution():
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, nums, stack: list, start: int):
+        self.ans.append(stack)
+        if start >= len(nums):
+            return
+
+        for i in range(start, len(nums)):
+            if i > start and nums[i] == nums[i-1]:
+                continue
+            stack.append(nums[i])
+            self.dfs(nums, stack[:], i+1)
+            stack.pop()
+
+    def subset(self, nums):
+        self.dfs(nums, [], 0)
+        return self.ans
+```
+
+### 39. Combination Sum
+
+[Leetcode](https://leetcode.com/problems/combination-sum/description)
+
+Given distinct candidate numbers and a target, return all unique combinations where the chosen numbers sum to the target. A candidate may be chosen unlimited times.
+
+```
+Example 1:
+Input: candidates = [2,3,6,7], target = 7
+Output: [[2,2,3],[7]]
+
+Example 2:
+Input: candidates = [2,3,5], target = 8
+Output: [[2,2,2,2],[2,3,3],[3,5]]
+```
+
+
+<details>
+<summary>Hint</summary>
+Reusing a candidate means the recursive call can pass the same index again.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Visualize the search as a binary tree. Sort the candidates and require each chosen number to be greater than or equal to the previous to avoid permutations of the same combination.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, track, candidates, target):
+        if sum(track) > target:
+            return
+        if sum(track) == target:
+            self.ans.append(track[:])
+            return
+        for i in range(len(candidates)):
+            if len(track) > 0 and candidates[i] < track[-1]:
+                continue
+            track.append(candidates[i])
+            self.dfs(track, candidates, target)
+            track.pop()
+
+    def combinationSum(self, candidates, target):
+        candidates.sort()
+        self.dfs([], candidates, target)
+        return self.ans
+```
+
+### 40. Combination Sum II
+
+[Leetcode](https://leetcode.com/problems/combination-sum-ii/description)
+
+Given candidate numbers that may contain duplicates and a target, return all unique combinations where the chosen numbers sum to the target. Each candidate may be used at most once.
+
+```
+Example 1:
+Input: candidates = [10,1,2,7,6,1,5], target = 8
+Output: [[1,1,6],[1,2,5],[1,7],[2,6]]
+
+Example 2:
+Input: candidates = [2,5,2,1,2], target = 5
+Output: [[1,2,2],[5]]
+```
+
+
+<details>
+<summary>Hint</summary>
+Using each number once means recursive calls advance to `i + 1`; skip same-level duplicates.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Same duplicate-pruning trick as *Permutations II*: skip a duplicate candidate only if the previous identical one is not part of the current track. Sort the candidates first.
+</details>
+
+```python
+class Solution():
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, track, start, used, candidates, target):
+        if sum(track) > target:
+            return
+        if sum(track) == target:
+            self.ans.append(track[:])
+
+        for i in range(start, len(candidates)):
+            if i > 0 and candidates[i] == candidates[i-1] and i-1 not in used:
+                continue
+            track.append(candidates[i])
+            used.add(i)
+            self.dfs(track, i+1, used, candidates, target)
+            track.pop()
+            used.remove(i)
+
+    def combinationSum2(self, candidates, target):
+        candidates.sort()
+        self.dfs([], 0, set(), candidates, target)
+        return self.ans
+```
+
+Alternative implementation that prunes with `i > start_index`:
+
+```python
+class Solution:
+    def combinationSum2(self, candidates: list[int], target: int) -> list[list[int]]:
+        results = []
+        candidates.sort()
+
+        def backtrack(current_combination, remaining_target, start_index):
+            if remaining_target == 0:
+                results.append(list(current_combination))
+                return
+            if remaining_target < 0:
+                return
+
+            for i in range(start_index, len(candidates)):
+                if candidates[i] > remaining_target:
+                    break
+                if i > start_index and candidates[i] == candidates[i - 1]:
+                    continue
+
+                current_combination.append(candidates[i])
+                backtrack(current_combination, remaining_target - candidates[i], i + 1)
+                current_combination.pop()
+
+        backtrack([], target, 0)
+        return results
+```
+
+### 216. Combination Sum III
+
+[Leetcode](https://leetcode.com/problems/combination-sum-iii/description)
+
+Find all valid combinations of `k` numbers that sum up to `n` such that the following conditions are true:
+
+- Only numbers 1 through 9 are used.
+- Each number is used at most once.
+
+Return a list of all possible valid combinations. The list must not contain the same combination twice.
+
+```
+Example 1:
+Input: k = 3, n = 7
+Output: [[1,2,4]]
+
+Example 2:
+Input: k = 3, n = 9
+Output: [[1,2,6],[1,3,5],[2,3,4]]
+
+Example 3:
+Input: k = 4, n = 1
+Output: []
+```
+
+<details>
+<summary>Hint</summary>
+The search space is only digits 1 through 9, so use increasing backtracking and prune negative remainders.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Backtrack over numbers `1..9` in increasing order. Stop when the track has `k` numbers; record it only if the remaining target is zero. Prune when the remaining sum is negative.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, track, start, k, n):
+        if len(track) == k and sum(track) == n:
+            self.ans.append(track[:])
+
+        if len(track) > k or sum(track) > n:
+            return
+
+        for i in range(start, 10):
+            track.append(i)
+            self.dfs(track, i+1, k, n)
+            track.pop()
+
+    def combinationSum3(self, k, n):
+        self.dfs([], 1, k, n)
+        return self.ans
+```
+
+### 967. Numbers With Same Consecutive Differences
+
+[Leetcode](https://leetcode.com/problems/numbers-with-same-consecutive-differences/description)
+
+Given two integers `n` and `k`, return an array of all the integers of length `n` where the difference between every two consecutive digits is `k`. Integers must not have leading zeros.
+
+```
+Example 1:
+Input: n = 3, k = 7
+Output: [181,292,707,818,929]
+
+Example 2:
+Input: n = 2, k = 1
+Output: [10,12,21,23,32,34,43,45,54,56,65,67,76,78,87,89,98]
+```
+
+<details>
+<summary>Hint</summary>
+The next digit depends only on the last digit of the current number.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Build numbers digit by digit. Start from leading digits `1..9`; for each last digit `d`, the next digit can be `d + k` or `d - k` if it stays in `[0,9]`. Use a set when `k = 0` to avoid duplicates.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, cur_num, trailing_digit, cur_len, n, k):
+        if cur_len == n:
+            self.ans.append(cur_num)
+            return
+
+        for l in range(10):
+            if abs(l - trailing_digit) == k:
+                cur_num *= 10
+                cur_num += l
+                trailing_digit = l
+                cur_len += 1
+                self.dfs(cur_num, trailing_digit, cur_len, n, k)
+                cur_len -= 1
+                cur_num //= 10
+                trailing_digit = cur_num % 10
+
+    def numsSameConsecDiff(self, n: int, k: int) -> List[int]:
+        for i in range(1, 10):
+            self.dfs(i, i, 1, n, k)
+        return self.ans
+```
+
+### 112. Path Sum
+
+[Leetcode](https://leetcode.com/problems/path-sum/description)
+
+Given the root of a binary tree and an integer `targetSum`, return whether the tree has a root-to-leaf path whose values sum to `targetSum`.
+
+```
+Example 1:
+Input: root = [5,4,8,11,null,13,4,7,2,null,null,null,1], targetSum = 22
+Output: true
+
+Example 2:
+Input: root = [1,2,3], targetSum = 5
+Output: false
+```
+
+
+<details>
+<summary>Hint</summary>
+Check the target only when the current node is a leaf.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+DFS from root to leaves with a running sum. Only a leaf can complete a valid path, so compare the sum with `targetSum` when both children are missing.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = False
+
+    def hasPathSum(self, root: Optional[TreeNode], targetSum: int) -> bool:
+        self.dfs(root, 0, targetSum)
+        return self.ans
+
+    def dfs(self, root, curSum, targetSum):
+        if root is None:
+            return
+
+        curSum += root.val
+        if root.left is None and root.right is None:
+            self.ans = self.ans or (curSum == targetSum)
+
+        self.dfs(root.left, curSum, targetSum)
+        self.dfs(root.right, curSum, targetSum)
+```
+
+Explicit DFS using a stack:
+
+```python
+class Solution:
+    def hasPathSum(self, root: Optional[TreeNode], targetSum: int) -> bool:
+        if not root:
+            return False
+
+        stack = [(root, root.val)]
+
+        while stack:
+            node, path_sum = stack.pop()
+
+            if not node.left and not node.right:
+                if path_sum == targetSum:
+                    return True
+
+            if node.right:
+                stack.append((node.right, path_sum + node.right.val))
+
+            if node.left:
+                stack.append((node.left, path_sum + node.left.val))
+
+        return False
+```
+
+### 437. Path Sum III
+
+[Leetcode](https://leetcode.com/problems/path-sum-iii/description)
+
+Given the root of a binary tree and `targetSum`, return the number of downward paths whose values sum to `targetSum`. A path may start and end at any nodes, but must go from parent to child.
+
+```
+Example 1:
+Input: root = [10,5,-3,3,2,null,11,3,-2,null,1], targetSum = 8
+Output: 3
+
+Example 2:
+Input: root = [5,4,8,11,null,13,4,7,2,null,null,5,1], targetSum = 22
+Output: 3
+```
+
+
+<details>
+<summary>Hint</summary>
+If two prefix sums differ by `targetSum`, the path between them is valid.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+For each node, maintain a running prefix sum from root to current node. If `curr_sum - previous_sum == targetSum`, then the path between those two positions sums to `targetSum`.
+
+Time complexity: `O(n)`.
+Space complexity: `O(h)` recursion stack average, `O(n)` worst-case for the prefix map.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = 0
+
+    def dfs(self, node, curr_sum, prefix, targetSum):
+        if not node:
+            return
+
+        curr_sum += node.val
+
+        # Count valid paths ending at current node
+        self.ans += prefix[curr_sum - targetSum]
+
+        # Add current prefix sum
+        prefix[curr_sum] += 1
+
+        self.dfs(node.left, curr_sum, prefix, targetSum)
+        self.dfs(node.right, curr_sum, prefix, targetSum)
+
+        # Backtrack
+        prefix[curr_sum] -= 1
+
+    def pathSum(self, root: Optional[TreeNode], targetSum: int) -> int:
+        prefix = defaultdict(int)
+        prefix[0] = 1
+
+        self.dfs(root, 0, prefix, targetSum)
+        return self.ans
+```
+
+### 491. Non-decreasing Subsequences
+
+[Leetcode](https://leetcode.com/problems/non-decreasing-subsequences/description)
+
+Given an integer array `nums`, return all the different possible non-decreasing subsequences of the given array with at least two elements.
+
+```
+Example 1:
+Input: nums = [4,6,7,7]
+Output: [[4,6],[4,6,7],[4,6,7,7],[4,7],[4,7,7],[6,7],[6,7,7],[7,7]]
+
+Example 2:
+Input: nums = [4,4,3,2,1]
+Output: [[4,4]]
+```
+
+<details>
+<summary>Hint</summary>
+You can't sort the array (that would destroy subsequence order), so the usual `nums[i] == nums[i-1]` duplicate skip won't work — dedupe by tracking which values have already been chosen at the current recursion depth.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+If `nums` was sorted, the problem effectively becomes *Subsets* with lengths greater than 1. But `nums` is *not* sorted, so we cannot prune duplicates with `i > start and nums[i] == nums[i-1]`. Instead use a set to deduplicate the answer.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = set()
+
+    def dfs(self, track, nums, start):
+        if len(track) >= 2:
+            self.ans.add(tuple(track))
+
+        for i in range(start, len(nums)):
+            if len(track) > 0 and track[-1] > nums[i]:
+                continue
+            track.append(nums[i])
+            self.dfs(track, nums, i+1)
+            track.pop()
+
+    def findSubsequences(self, nums):
+        self.dfs([], nums, 0)
+        return [list(elm) for elm in self.ans]
+```
+
+### 93. Restore IP Addresses
+
+[Leetcode](https://leetcode.com/problems/restore-ip-addresses/description)
+
+Given a string containing only digits, return all possible valid IP addresses that can be formed by inserting three dots. Each segment must be between `0` and `255`, and cannot have leading zeros unless it is exactly `0`.
+
+```
+Example 1:
+Input: s = "25525511135"
+Output: ["255.255.11.135","255.255.111.35"]
+
+Example 2:
+Input: s = "0000"
+Output: ["0.0.0.0"]
+```
+
+
+<details>
+<summary>Hint</summary>
+There must be exactly four segments; each segment has length 1 to 3 and value at most 255.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Backtrack by choosing the next segment length from 1 to 3. A segment is valid if it has no leading zero unless it is `0`, and its integer value is at most 255.
+</details>
+
+```python
+class Solution:
+    def __init__(self):
+        self.ans = []
+
+    def dfs(self, s, track, start):
+        if len(track) == 4 and start == len(s):
+            self.ans.append(".".join(track))
+            return
+        if len(track) == 4 or start == len(s):
+            return
+
+        for i in range(start, len(s)):
+            if s[start] == '0' and i > start:
+                continue
+            if int(s[start:i+1]) <= 255:
+                track.append(s[start:i+1])
+                self.dfs(s, track, i+1)
+                track.pop()
+
+    def restoreIpAddresses(self, s: str) -> List[str]:
+        self.dfs(s, [], 0)
+        return self.ans
+```
+
+## Dynamic Programming
+
+### 518. Coin Change II
+
+[Leetcode](https://leetcode.com/problems/coin-change-ii/description/)
+
+You are given an integer array `coins` representing coins of different denominations and an integer `amount` representing a total amount of money. Return the number of combinations that make up that amount. You may assume that you have an infinite number of each kind of coin.
+
+```
+Example 1:
+Input: amount = 5, coins = [1,2,5]
+Output: 4
+
+Example 2:
+Input: amount = 3, coins = [2]
+Output: 0
+
+Example 3:
+Input: amount = 10, coins = [10]
+Output: 1
+```
+
+<details>
+<summary>Hint</summary>
+For combinations, loop coins outside and amounts inside to avoid counting orderings.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Iterate the coins in the outer loop and amounts in the inner loop. Swapping the order (amounts outside, coins inside) computes the number of *permutations* rather than *combinations*.
+</details>
+
+```python
+class Solution:
+    def change(self, amount: int, coins: list) -> int:
+        dp = [0] * (amount + 1)
+        dp[0] = 1
+
+        for coin in coins:
+            for i in range(coin, amount + 1):
+                dp[i] += dp[i - coin]
+
+        return dp[-1]
+```
+
+### 494. Target Sum
+
+[Leetcode](https://leetcode.com/problems/target-sum/description)
+
+You are given an integer array `nums` and an integer `target`. You build an expression by adding `+` or `-` before each integer. Return the number of expressions that evaluate to `target`.
+
+```
+Example 1:
+Input: nums = [1,1,1,1,1], target = 3
+Output: 5
+
+Example 2:
+Input: nums = [1], target = 1
+Output: 1
+```
+
+<details>
+<summary>Hint</summary>
+Assigning signs can be converted to a subset-sum count.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Transform into a knapsack variant. Let `P` be numbers with `+`, `N` be numbers with `-`. We want `sum(P) - sum(N) = target` and `sum(P) + sum(N) = total_sum`. Adding: `2 * sum(P) = target + total_sum`, so `sum(P) = (target + total_sum) / 2`. The problem becomes: count subsets of `nums` with sum equal to `(target + total_sum) / 2`. Unlike coin change, each number can be used at most once — iterate amounts in reverse to use a 1D `dp` array.
+</details>
+
+```python
+def findTargetSumWays(self, nums, target):
+    nums_sum = sum(nums)
+    if nums_sum + target < 0 or (nums_sum + target) % 2 != 0:
+        return 0
+
+    new_target = (nums_sum + target) // 2
+    dp = [0] * (new_target + 1)
+    dp[0] = 1
+
+    for num in nums:
+        for j in range(new_target, num - 1, -1):
+            dp[j] += dp[j - num]
+
+    return dp[new_target]
+```
+
+### 931. Minimum Falling Path Sum
+
+[Leetcode](https://leetcode.com/problems/minimum-falling-path-sum/description/)
+
+Given an `n x n` matrix, return the minimum sum of a falling path. A falling path starts in any cell of the first row and chooses the next row's same column, left diagonal, or right diagonal.
+
+```
+Example 1:
+Input: matrix = [[2,1,3],[6,5,4],[7,8,9]]
+Output: 13
+
+Example 2:
+Input: matrix = [[-19,57],[-40,-5]]
+Output: -59
+```
+
+
+<details>
+<summary>Hint</summary>
+Each cell depends only on up to three cells in the previous row.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Dynamic programming by rows. `dp[i][j]` is the minimum path sum ending at cell `(i,j)`, computed from the three possible cells in the previous row.
+</details>
+
+```python
+def minFallingPathSum(self, matrix: List[List[int]]) -> int:
+    n = len(matrix)
+    dp = [[100**2] * n for _ in range(n)]
+    ans = 100**2
+
+    for j in range(n):
+        dp[0][j] = matrix[0][j]
+
+    for i in range(1, n):
+        for j in range(n):
+            dp[i][j] = min(dp[i][j], dp[i-1][j])
+            if j-1 >= 0:
+                dp[i][j] = min(dp[i][j], dp[i-1][j-1])
+            if j+1 < n:
+                dp[i][j] = min(dp[i][j], dp[i-1][j+1])
+
+            dp[i][j] += matrix[i][j]
+            if i == n-1:
+                ans = min(ans, dp[i][j])
+
+    return ans
+```
+
+### 486. Predict the Winner
+
+[Leetcode](https://leetcode.com/problems/predict-the-winner/description/)
+
+Given an array `nums`, two players alternately take one number from either end. Each plays optimally. Return whether Player 1 can win or tie.
+
+```
+Example 1:
+Input: nums = [1,5,2]
+Output: false
+
+Example 2:
+Input: nums = [1,5,233,7]
+Output: true
+```
+
+
+<details>
+<summary>Hint</summary>
+Think in score difference rather than absolute scores.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Recursive game-theory formulation: the current player chooses either end and the opponent then plays optimally on the remaining subarray. `dp[i][j]` stores the maximum score difference the current player can achieve on `nums[i..j]`.
+</details>
+
+Recursive version:
+
+```python
+class Solution:
+    def dp(self, nums, i, j, first):
+        if i == j:
+            return nums[i] if first == 0 else -nums[i]
+        if first:  # player 2's round
+            return min(-nums[i] + self.dp(nums, i+1, j, 0),
+                       -nums[j] + self.dp(nums, i, j-1, 0))
+        else:  # player 1's round
+            return max(nums[i] + self.dp(nums, i+1, j, 1),
+                       nums[j] + self.dp(nums, i, j-1, 1))
+
+    def win(self, nums):
+        ret = self.dp(nums, 0, len(nums) - 1, 0)
+        return ret >= 0
+```
+
+Tabulated version:
+
+```python
+class Solution:
+    def predictTheWinner(self, nums: List[int]) -> bool:
+        n = len(nums)
+        dp = [[0] * n for _ in range(n)]
+
+        for i in range(n):
+            dp[i][i] = nums[i]
+
+        for length in range(2, n + 1):
+            for i in range(n - length + 1):
+                j = i + length - 1
+                choice1 = nums[i] - dp[i + 1][j]
+                choice2 = nums[j] - dp[i][j - 1]
+                dp[i][j] = max(choice1, choice2)
+
+        return dp[0][n - 1] >= 0
+```
+
+> Space optimization is also possible; complexity can come down to `O(N)` with careful row reuse.
+
+### 44. Wildcard Matching (Dynamic Programming)
+
+[Leetcode](https://leetcode.com/problems/wildcard-matching/description/)
+
+Given an input string `s` and a pattern `p`, implement wildcard pattern matching with support for `?` and `*`:
+
+- `?` matches any single character.
+- `*` matches any sequence of characters (including the empty sequence).
+
+The matching should cover the entire input string (not partial).
+
+```
+Example 1:
+Input: s = "aa", p = "a"
+Output: false
+
+Example 2:
+Input: s = "aa", p = "*"
+Output: true
+
+Example 3:
+Input: s = "cb", p = "?a"
+Output: false
+```
+
+<details>
+<summary>Hint</summary>
+For `*`, consider both using it as empty and using it to consume one more character.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Let `dp[i][j]` mean whether `s[:i]` matches `p[:j]`. A normal character or `?` consumes one char from both strings; `*` either consumes nothing (`dp[i][j-1]`) or consumes one char from `s` (`dp[i-1][j]`).
+</details>
+
+```python
+def wildcard(self, s, p):
+    dp = [[False] * (len(p)+1) for _ in range(len(s)+1)]
+
+    dp[0][0] = True
+    for j in range(1, len(dp[0])):
+        if p[j-1] == '*':
+            dp[0][j] = dp[0][j-1]
+
+    for i in range(1, len(dp)):
+        for j in range(1, len(dp[0])):
+            if p[j-1] == '?':
+                dp[i][j] = dp[i][j] or dp[i-1][j-1]
+            elif p[j-1] == '*':
+                dp[i][j] = dp[i][j] or dp[i][j-1] or dp[i-1][j]
+            elif s[i-1] == p[j-1]:
+                dp[i][j] = dp[i][j] or dp[i-1][j-1]
+
+    return dp[-1][-1]
+```
+
+The two-pointer solution can be found under [Two Pointers — Wildcard Matching](#two-pointers).
+
+### 300. Longest Increasing Subsequence
+
+[Leetcode](https://leetcode.com/problems/longest-increasing-subsequence/description/)
+
+Given an integer array `nums`, return the length of the longest strictly increasing subsequence.
+
+```
+Example 1:
+Input: nums = [10,9,2,5,3,7,101,18]
+Output: 4
+
+Example 2:
+Input: nums = [0,1,0,3,2,3]
+Output: 4
+
+Example 3:
+Input: nums = [7,7,7,7,7,7,7]
+Output: 1
+```
+
+<details>
+<summary>Hint</summary>
+Either let `dp[i]` be the LIS length ending at `nums[i]` for an `O(n^2)` solution, or maintain the smallest possible tail for each length and binary-search each new number into it for `O(n log n)`.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+**Solution 1 — patience / binary search:** Maintain `tails` where `tails[i]` is the smallest tail of all increasing subsequences of length `i+1`. For each `num`, binary search for the first element `>= num`. If `num` is greater than every tail, append; otherwise replace. The final length of `tails` is the answer.
+
+**Solution 2 — `O(n^2)` DP:** Let `dp[i]` be the length of the LIS ending at `nums[i]`. The answer is `max(dp)`.
+</details>
+
+Solution 1:
+
+```python
+def lengthOfLIS(self, nums: list[int]) -> int:
+    tails = []
+
+    for num in nums:
+        i, j = 0, len(tails)
+        while i < j:
+            m = (i + j) // 2
+            if tails[m] < num:
+                i = m + 1
+            else:
+                j = m
+        if i == len(tails):
+            tails.append(num)
+        else:
+            tails[i] = num
+
+    return len(tails)
+```
+
+Solution 2:
+
+```python
+def lengthOfLIS(self, nums: List[int]) -> int:
+    dp = [1] * len(nums)
+
+    for i in range(len(nums)):
+        for j in range(i):
+            if nums[i] > nums[j]:
+                dp[i] = max(dp[i], dp[j] + 1)
+
+    res = 0
+    for i in range(len(dp)):
+        res = max(res, dp[i])
+    return res
+```
+
+## Linked List
+
+> Unless specified otherwise, the linked list node used in the following problems is defined as:
+>
+> ```python
+> class ListNode:
+>     def __init__(self, val=0, next_node=None):
+>         self.val = val
+>         self.next = next_node
+> ```
+
+### 206. Reverse Linked List
+
+[Leetcode](https://leetcode.com/problems/reverse-linked-list/description)
+
+Given the head of a singly linked list, reverse the list and return the new head.
+
+```
+Example 1:
+Input: head = [1,2,3,4,5]
+Output: [5,4,3,2,1]
+
+Example 2:
+Input: head = [1,2]
+Output: [2,1]
+```
+
+
+<details>
+<summary>Hint</summary>
+Save `current.next` before overwriting it.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Iterate through the list and reverse one pointer at a time using `prev`, `current`, and `next_node`. At the end, `prev` is the new head.
+</details>
+
+Iterative approach using three pointers:
+
+```python
+# Time: O(n) | Space: O(1)
+def reverseList(self, head: Optional[ListNode]) -> Optional[ListNode]:
+    prev = None
+    current = head
+
+    while current:
+        next_node = current.next
+        current.next = prev
+        prev = current
+        current = next_node
+
+    return prev
+```
+
+Recursive approach:
+
+```python
+# Time: O(n) | Space: O(n) due to recursion stack
+def reverseList(self, head: Optional[ListNode]) -> Optional[ListNode]:
+    if not head or not head.next:
+        return head
+
+    new_head = self.reverseList(head.next)
+
+    head.next.next = head
+    head.next = None
+
+    return new_head
+```
+
+### 92. Reverse Linked List II
+
+[Leetcode](https://leetcode.com/problems/reverse-linked-list-ii/description)
+
+Reverse a linked list between the i-th and j-th node.
+
+<details>
+<summary>Hint</summary>
+A dummy node simplifies reversing when the sublist starts at the head.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use a dummy node and move `prev` to the node before the sublist. Reverse exactly `right-left+1` nodes, then reconnect the reversed segment to the surrounding list.
+</details>
+
+Solution 1 — reverse the sublist in place, then reattach:
+
+```python
+# Time: O(n) | Space: O(1)
+def reverseListBetween(self, head, i, j):
+    if not head or i == j:
+        return head
+
+    dummy = ListNode(0)
+    dummy.next = head
+
+    prev_start = dummy
+    for _ in range(i - 1):
+        prev_start = prev_start.next
+
+    start = prev_start.next
+
+    prev = None
+    current = start
+
+    for _ in range(j - i + 1):
+        next_node = current.next
+        current.next = prev
+        prev = current
+        current = next_node
+
+    prev_start.next = prev
+    start.next = current
+
+    return dummy.next
+```
+
+Solution 2 — head-insert pattern:
+
+```python
+# Time: O(n) | Space: O(1)
+def reverseListBetween(self, head, i, j):
+    if not head or i == j:
+        return head
+
+    dummy = ListNode(0)
+    dummy.next = head
+
+    prev = dummy
+    for _ in range(i - 1):
+        prev = prev.next
+
+    current = prev.next
+
+    for _ in range(j - i):
+        next_node = current.next
+        current.next = next_node.next
+        next_node.next = prev.next
+        prev.next = next_node
+
+    return dummy.next
+```
+
+## Monotone Stack
+
+### 402. Remove K Digits
+
+[Leetcode](https://leetcode.com/problems/remove-k-digits/description)
+
+Given a non-negative integer string `num` and an integer `k`, remove exactly `k` digits so the remaining number is as small as possible. Return the result without leading zeros, or `"0"` if empty.
+
+```
+Example 1:
+Input: num = "1432219", k = 3
+Output: "1219"
+
+Example 2:
+Input: num = "10200", k = 1
+Output: "200"
+```
+
+
+<details>
+<summary>Hint</summary>
+Maintain an increasing stack; pop while the previous digit is larger and removals remain.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Start from the leftmost digit and remove digits that are followed by smaller ones — for example, it's better to remove `4` from `43***` than `3`. Use a `while` (not `if`) when popping: otherwise consecutive repeating digits give wrong answers like `1419` for `num = "1443219", k = 3` (correct is `1219`).
+</details>
+
+```python
+def removeKdigits(self, num: str, k: int) -> str:
+    stack = []
+
+    for n in num:
+        while k > 0 and stack and stack[-1] > n:
+            stack.pop()
+            k -= 1
+
+        stack.append(n)
+
+    # If k is not exhausted, remove from the end (sorted prefix case).
+    while k > 0:
+        stack.pop()
+        k -= 1
+
+    ans = "".join(stack)
+    ans = ans.lstrip("0")
+
+    return ans if ans else "0"
+```
+
+### 581. Shortest Unsorted Continuous Subarray
+
+[Leetcode](https://leetcode.com/problems/shortest-unsorted-continuous-subarray/description)
+
+Given an integer array `nums`, find one continuous subarray such that sorting just that subarray makes the whole array non-decreasing. Return its length.
+
+```
+Example 1:
+Input: nums = [2,6,4,8,10,9,15]
+Output: 5
+
+Example 2:
+Input: nums = [1,2,3,4]
+Output: 0
+
+Example 3:
+Input: nums = [1]
+Output: 0
+```
+
+<details>
+<summary>Hint</summary>
+Compare with the sorted copy or scan for elements violating prefix/suffix bounds.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Sorting with original indices works but is `O(N log N)`. A two-pass `O(N)` approach: use a monotonically increasing stack to find the leftmost index that gets popped (the left border) and a monotonically decreasing stack to find the right border. Answer is `right - left + 1` (or 0 if neither was updated).
+
+You must iterate the entire array — a number with a smaller index can be popped *after* a number with a larger index because of a small number encountered later. We want the leftmost popped index, not the earliest popped.
+</details>
+
+```python
+def findUnsortedSubarray(self, nums: List[int]) -> int:
+    left = float('inf')
+    right = float('-inf')
+    inc_stack = []
+    dec_stack = []
+
+    for i, num in enumerate(nums):
+        while inc_stack and nums[inc_stack[-1]] > num:
+            idx = inc_stack.pop()
+            left = min(left, idx)
+        inc_stack.append(i)
+
+    for i in range(len(nums)-1, -1, -1):
+        while dec_stack and nums[dec_stack[-1]] < nums[i]:
+            idx = dec_stack.pop()
+            right = max(right, idx)
+        dec_stack.append(i)
+
+    return right - left + 1 if left < float('inf') else 0
+```
+
+A simpler two-pointer-style variant without explicit stacks:
+
+```python
+def findUnsortedSubarray(self, nums: List[int]) -> int:
+    n = len(nums)
+    if n < 2:
+        return 0
+
+    max_so_far = nums[0]
+    end = -1
+    for i in range(1, n):
+        if nums[i] < max_so_far:
+            end = i
+        else:
+            max_so_far = nums[i]
+    if end == -1:
+        return 0
+
+    min_so_far = nums[n - 1]
+    start = -1
+    for i in range(n - 2, -1, -1):
+        if nums[i] > min_so_far:
+            start = i
+        else:
+            min_so_far = nums[i]
+
+    return end - start + 1
+```
+
+## Prefix Sum
+
+### 525. Contiguous Array
+
+[Leetcode](https://leetcode.com/problems/contiguous-array/description)
+
+Given a binary array `nums`, return the maximum length of a contiguous subarray with an equal number of `0` and `1`.
+
+```
+Example 1:
+Input: nums = [0,1]
+Output: 2
+
+Example 2:
+Input: nums = [0,1,0]
+Output: 2
+```
+
+
+<details>
+<summary>Hint</summary>
+Map 0 to -1 and 1 to +1; equal prefix sums mean balanced subarray.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Build a prefix sum where every `1` contributes `+1` and every `0` contributes `-1`. Any subarray with zero "sum" has an equal number of 1s and 0s. Two pointers don't work because there is no monotonicity when the window expands or shrinks.
+</details>
+
+```python
+def findMaxLength(self, nums):
+    n = len(nums)
+    presum = [0] * n
+    max_len = 0
+    d = dict()
+
+    for i, num in enumerate(nums):
+        if num == 1:
+            presum[i] = presum[i-1] + 1
+        else:
+            presum[i] = presum[i-1] - 1
+
+    for i in range(len(presum)):
+        if presum[i] not in d:
+            d[presum[i]] = i
+        else:
+            max_len = max(max_len, i - d[presum[i]])
+        if presum[i] == 0:
+            max_len = max(max_len, i + 1)
+
+    return max_len
+```
+
+### 523. Continuous Subarray Sum
+
+[Leetcode](https://leetcode.com/problems/continuous-subarray-sum/description)
+
+Given an integer array `nums` and an integer `k`, return whether there is a subarray of length at least two whose sum is a multiple of `k`.
+
+```
+Example 1:
+Input: nums = [23,2,4,6,7], k = 6
+Output: true
+
+Example 2:
+Input: nums = [23,2,6,4,7], k = 13
+Output: false
+```
+
+
+<details>
+<summary>Hint</summary>
+Equal prefix remainders modulo `k` imply the intervening subarray sum is divisible by `k`.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use the remainder of the prefix sum modulo `k` instead of the sum itself. If `prefix_remainder[i] == prefix_remainder[j]`, then the sum of `nums[i+1..j]` is divisible by `k`.
+</details>
+
+```python
+def checkSubarraySum(self, nums, k):
+    prefix_remainder = [0] * len(nums)
+    # Initialize with 0 to deal with the case where the prefix nums[:j] is divisible by k.
+    d = {0: -1}
+    for i in range(len(nums)):
+        if i == 0:
+            prefix_remainder[i] += nums[i]
+        else:
+            prefix_remainder[i] += (prefix_remainder[i-1] + nums[i])
+        prefix_remainder[i] %= k
+
+    for i in range(len(prefix_remainder)):
+        if prefix_remainder[i] not in d:
+            d[prefix_remainder[i]] = i
+        if prefix_remainder[i] in d and i - d[prefix_remainder[i]] >= 2:
+            return True
+    return False
+```
+
+## Sliding Window
+
+### 713. Subarray Product Less Than K
+
+[Leetcode](https://leetcode.com/problems/subarray-product-less-than-k/description)
+
+Given an array of positive integers `nums` and an integer `k`, return the number of contiguous subarrays whose product is strictly less than `k`.
+
+```
+Example 1:
+Input: nums = [10,5,2,6], k = 100
+Output: 8
+
+Example 2:
+Input: nums = [1,2,3], k = 0
+Output: 0
+```
+
+
+<details>
+<summary>Hint</summary>
+After fixing the right endpoint, all starts from `left` to `right` are valid.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use a sliding window. Expand the right side one step at a time, then shrink from the left until the product is strictly under `k`. Every subarray ending at `right` and starting in `[left, right]` is valid — there are exactly `right - left + 1` of them, with no double counting.
+
+For example, when `right = 0`, `left` stays at 0, the only valid subarray is `[10]`. When `right = 1`, the product is still below `k`, `left` stays at 0, valid subarrays are `[[10, 5], [5]]`.
+</details>
+
+```python
+def numberContiguousArrays(self, nums, k):
+    left = 0
+    cur_product = 1
+    count = 0
+
+    for right in range(len(nums)):
+        cur_product *= nums[right]
+
+        while left <= right and cur_product >= k:
+            cur_product /= nums[left]
+            left += 1
+
+        count += (right - left + 1)
+
+    return count
+```
+
+### 395. Longest Substring with At Least K Repeating Characters
+
+[Leetcode](https://leetcode.com/problems/longest-substring-with-at-least-k-repeating-characters/description)
+
+Given a string `s` and integer `k`, return the length of the longest substring such that every character in the substring appears at least `k` times.
+
+```
+Example 1:
+Input: s = "aaabb", k = 3
+Output: 3
+
+Example 2:
+Input: s = "ababbc", k = 2
+Output: 5
+```
+
+
+<details>
+<summary>Hint</summary>
+Fix the number of unique characters in the window, then sliding window becomes manageable.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Standard sliding window does not work directly: expanding the window can introduce a new character that immediately breaks validity, and shrinking the window does not help recover. Trick: the alphabet has at most 26 letters, so iterate `n` from 1 to 26 and find the longest substring that contains exactly `n` unique characters, each with at least `k` occurrences. The maximum across `n` is the answer.
+
+Maintain `window_count` (unique characters in the window) and `valid_count` (characters with at least `k` occurrences). A valid substring corresponds to `valid_count == n` and `window_count == n`.
+</details>
+
+```python
+def longestSubstring(self, s: str, k: int):
+    ans = 0
+    for n in range(1, 27):
+        l, r = 0, 0
+        counter = defaultdict(int)
+        window_count = 0
+        valid_count = 0
+
+        while r < len(s):
+            counter[s[r]] += 1
+            if counter[s[r]] == 1:
+                window_count += 1
+            if counter[s[r]] == k:
+                valid_count += 1
+            if window_count == n and valid_count == n:
+                ans = max(ans, r - l + 1)
+                r += 1
+
+            while window_count > n:
+                if counter[s[l]] == k:
+                    valid_count -= 1
+                if counter[s[l]] == 1:
+                    window_count -= 1
+                    counter[s[l]] -= 1
+                    l += 1
+
+        return ans
+```
+
+### 3. Longest Substring Without Repeating Characters
+
+[Leetcode](https://leetcode.com/problems/longest-substring-without-repeating-characters/description)
+
+Given a string `s`, find the length of the longest substring without duplicate characters.
+
+```
+Example 1:
+Input: s = "abcabcbb"
+Output: 3
+
+Example 2:
+Input: s = "bbbbb"
+Output: 1
+
+Example 3:
+Input: s = "pwwkew"
+Output: 3
+```
+
+<details>
+<summary>Hint</summary>
+Move the left pointer past the previous occurrence of a repeated character.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use a dictionary to track characters in the window and the indices where they were last seen. When the incoming character already appears in the window, shrink the window from the left to maintain validity.
+</details>
+
+Solution 1:
+
+```python
+def longestSubstringNoRepeat(self, s):
+    window = set()
+    l, r = 0, 0
+    ans = 0
+
+    while r < len(s):
+        c = s[r]
+
+        while l <= r and c in window:
+            window.remove(s[l])
+            l += 1
+
+        window.add(c)
+
+        ans = max(ans, r - l + 1)
+        r += 1
+
+    return ans
+```
+
+Solution 2:
+
+```python
+def longestSubstringNoRepeat(self, s):
+    window = dict()
+
+    left, right = 0, 0
+    max_length = 0
+
+    while right < len(s):
+        c = s[right]
+
+        if c in window:
+            left = max(left, window[c] + 1)
+
+        window[c] = right
+        max_length = max(max_length, right - left + 1)
+        right += 1
+
+    return max_length
+```
+
+### 1658. Minimum Operations to Reduce X to Zero
+
+[Leetcode](https://leetcode.com/problems/minimum-operations-to-reduce-x-to-zero/description)
+
+You are given an integer array `nums` and an integer `x`. In one operation, you can remove either the leftmost or rightmost element from `nums` and subtract its value from `x`. Return the minimum number of operations to reduce `x` to exactly 0, or `-1` if impossible.
+
+```
+Example 1:
+Input: nums = [1,1,4,2,3], x = 5
+Output: 2
+
+Example 2:
+Input: nums = [5,6,7,8,9], x = 4
+Output: -1
+
+Example 3:
+Input: nums = [3,2,20,1,1,3], x = 10
+Output: 5
+
+Example 4:
+Input: nums = [1,2,3,4,5], x = 15
+Output: 5
+```
+
+<details>
+<summary>Hint</summary>
+Equivalent to keeping the longest middle subarray with sum `sum(nums) - x`.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Picking from either end to sum to `x` is equivalent to finding the *longest* contiguous middle subarray that sums to `sum(nums) - x`. Once you have its length, the answer is `len(nums) - max_len`. After the transformation a plain sliding window works.
+</details>
+
+```python
+def minOpsReduceToZero(self, nums, x):
+    target = sum(nums) - x
+    l = 0
+    window_sum = 0
+    max_len = -1
+
+    for r, num in enumerate(nums):
+        window_sum += num
+        # l <= r needed to handle target = 0
+        while l <= r and window_sum > target:
+            window_sum -= nums[l]
+            l += 1
+
+        if window_sum == target:
+            max_len = max(max_len, r - l + 1)
+
+    return len(nums) - max_len if max_len != -1 else -1
+```
+
+### 76. Minimum Window Substring
+
+[Leetcode](https://leetcode.com/problems/minimum-window-substring/description)
+
+Given two strings `s` and `t`, return the minimum window substring of `s` such that every character in `t` (including duplicates) is included in the window. If no such substring exists, return `""`.
+
+```
+Example 1:
+Input: s = "ADOBECODEBANC", t = "ABC"
+Output: "BANC"
+
+Example 2:
+Input: s = "a", t = "a"
+Output: "a"
+
+Example 3:
+Input: s = "a", t = "aa"
+Output: ""
+```
+
+<details>
+<summary>Hint</summary>
+Shrink only after the window contains all required characters with enough multiplicity.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Use a sliding window with character counts. Expand right until the window satisfies all required counts, then shrink left while preserving validity to minimize the window.
+</details>
+
+```python
+def minWindow(self, s: str, t: str) -> str:
+    window = {}
+    need = Counter(t)
+    valid_count = 0
+    min_l, min_r = 0, len(s) + 1
+    l, r = 0, 0
+
+    while r < len(s):
+        c = s[r]
+        r += 1
+        window[c] = window.get(c, 0) + 1
+        if window[c] == need[c]:
+            valid_count += 1
+
+        # Shrink while feasible to find the optimum.
+        while l < r and valid_count == len(need):
+            if r - l < min_r - min_l:
+                min_l, min_r = l, r
+            c = s[l]
+            l += 1
+            if c in window:
+                if window[c] == need[c]:
+                    valid_count -= 1
+                window[c] -= 1
+
+    return "" if min_r > len(s) else s[min_l:min_r]
+```
+
+### 219. Contains Duplicate II
+
+[Leetcode](https://leetcode.com/problems/contains-duplicate-ii/description)
+
+Given an integer array `nums` and integer `k`, return whether there are two distinct indices `i` and `j` such that `nums[i] == nums[j]` and `abs(i - j) <= k`.
+
+```
+Example 1:
+Input: nums = [1,2,3,1], k = 3
+Output: true
+
+Example 2:
+Input: nums = [1,0,1,1], k = 1
+Output: true
+```
+
+
+<details>
+<summary>Hint</summary>
+Only the last `k` elements matter.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Keep a sliding window of the last `k` elements or store the most recent index for each value. If the same value appears within distance `k`, return true.
+</details>
+
+```python
+def containsNearbyDuplicate(self, nums: List[int], k: int) -> bool:
+    if k == 0:
+        return False
+
+    l, r = 0, 0
+    window = dict()
+
+    while r < len(nums):
+        if nums[r] in window:
+            return True
+
+        while r - l >= k:
+            del window[nums[l]]
+            l += 1
+        window[nums[r]] = r
+        r += 1
+
+    return False
+```
+
+## Two Pointers
+
+### 48. Rotate Image
+
+[Leetcode](https://leetcode.com/problems/rotate-image/description)
+
+You are given an `n × n` matrix representing an image, rotate the image by 90 degrees (clockwise) in place.
+
+```
+1 2 3       7 4 1
+4 5 6   ->  8 5 2
+7 8 9       9 6 3
+```
+
+<details>
+<summary>Hint</summary>
+Clockwise rotation can be done by transposing, then reversing each row.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+- Process the matrix by *layers*; the number of layers is `n // 2`.
+- Rotating 90° clockwise is equivalent to a transpose followed by a horizontal flip: `(i, j) → (j, i) → (j, n-1-i)`.
+
+For a single chain in a layer the index trajectory is:
+
+`(i, j) → (j, n-1-i) → (n-1-i, n-1-j) → (n-1-j, i)`
+</details>
+
+```python
+class Solution:
+    def rotate(self, matrix: list[list[int]]) -> None:
+        n = len(matrix)
+
+        # Transpose the matrix.
+        for i in range(n):
+            for j in range(i + 1, n):
+                matrix[i][j], matrix[j][i] = matrix[j][i], matrix[i][j]
+
+        # Reverse each row to complete a clockwise rotation.
+        for row in matrix:
+            row.reverse()
+```
+
+### 15. Three Sum
+
+[Leetcode](https://leetcode.com/problems/3sum/description)
+
+Given an integer array `nums`, return all unique triplets `[nums[i], nums[j], nums[k]]` such that `i`, `j`, and `k` are distinct and the sum is zero.
+
+```
+Example 1:
+Input: nums = [-1,0,1,2,-1,-4]
+Output: [[-1,-1,2],[-1,0,1]]
+
+Example 2:
+Input: nums = [0,1,1]
+Output: []
+```
+
+
+<details>
+<summary>Hint</summary>
+After sorting, two pointers can find pairs for each fixed first value.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Sort, then for each `i`, run two pointers on the suffix to find pairs summing to `-nums[i]`. Don't forget to skip duplicates for `nums[i]`, `nums[l]`, and `nums[r]`.
+</details>
+
+```python
+"""
+Time: O(N log N + N^2) = O(N^2)
+Space: O(1)
+"""
+def threeSum(self, nums: List[int]) -> List[List[int]]:
+    ans = []
+    nums.sort()
+    for i, target in enumerate(nums):
+        if i + 2 >= len(nums):
+            break
+        if i > 0 and nums[i] == nums[i-1]:
+            continue
+        l, r = i + 1, len(nums) - 1
+        while l < r:
+            triplet_sum = nums[l] + nums[r] + target
+            if triplet_sum == 0:
+                ans.append([target, nums[l], nums[r]])
+                while l < r and nums[l] == nums[l+1]:
+                    l += 1
+                while l < r and nums[r] == nums[r-1]:
+                    r -= 1
+                l += 1
+                r -= 1
+            elif triplet_sum > 0:
+                r -= 1
+            else:
+                l += 1
+    return ans
+```
+
+### 80. Remove Duplicates from Sorted Array II
+
+[Leetcode](https://leetcode.com/problems/remove-duplicates-from-sorted-array-ii/description)
+
+Given a sorted array `nums`, remove duplicates in place so each unique element appears at most twice. Return the new length `k`; the first `k` elements should contain the answer.
+
+```
+Example 1:
+Input: nums = [1,1,1,2,2,3]
+Output: 5, nums = [1,1,2,2,3,_]
+
+Example 2:
+Input: nums = [0,0,1,1,1,1,2,3,3]
+Output: 7, nums = [0,0,1,1,2,3,3,_,_]
+```
+
+
+<details>
+<summary>Hint</summary>
+A new value can be written if it differs from the element two positions before the write pointer.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Maintain a write pointer `l` such that `nums[:l]` is the valid processed prefix where every value appears at most twice. Iterate with `r`; if `nums[r] == nums[l-2]`, that would be a third occurrence — skip it.
+</details>
+
+Solution 1:
+
+```python
+def removeDuplicates(self, nums):
+    l = 0
+    for r in range(len(nums)):
+        if r >= 2 and nums[r] == nums[l-2]:
+            continue
+        nums[l] = nums[r]
+        l += 1
+    return l
+```
+
+Solution 2 — explicitly skip the first two:
+
+```python
+def removeDuplicates(self, nums):
+    if len(nums) <= 2:
+        return len(nums)
+    l = 2
+
+    for r in range(2, len(nums)):
+        if nums[r] != nums[l - 2]:
+            nums[l] = nums[r]
+            l += 1
+    return l
+```
+
+### 151. Reverse Words in a String
+
+[Leetcode](https://leetcode.com/problems/reverse-words-in-a-string/description)
+
+Given an input string `s`, reverse the order of the words. Words are sequences of non-space characters separated by at least one space. The returned string should have a single space between words and no leading/trailing spaces.
+
+```
+Example 1:
+Input: s = "the sky is blue"
+Output: "blue is sky the"
+
+Example 2:
+Input: s = "  hello world  "
+Output: "world hello"
+
+Example 3:
+Input: s = "a good   example"
+Output: "example good a"
+```
+
+<details>
+<summary>Hint</summary>
+Normalize spaces by extracting words first.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Split the string into words, discard extra spaces, reverse the list of words, and join them with single spaces.
+</details>
+
+```python
+def reverseWords(self, s: str) -> str:
+    return " ".join(reversed(s.split()))
+```
+
+### 75. Sort Colors
+
+[Leetcode](https://leetcode.com/problems/sort-colors/description)
+
+Given an array `nums` of `n` objects colored red (0), white (1), or blue (2), sort them in place so colors appear in order red, white, blue.
+
+```
+Example 1:
+Input: nums = [2,0,2,1,1,0]
+Output: [0,0,1,1,2,2]
+
+Example 2:
+Input: nums = [2,0,1]
+Output: [0,1,2]
+```
+
+<details>
+<summary>Hint</summary>
+Maintain three regions: zeros before `left`, twos after `right`, unknown in the middle.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Dutch National Flag (3-way partitioning). Maintain three pointers:
+
+1. `low`: end of the 0s section; everything left of `low` is 0.
+2. `mid`: current element under examination; `[low, mid)` is all 1s.
+3. `high`: start of the 2s section; everything right of `high` is 2.
+
+Loop invariant while iterating:
+
+- `[0, low)` is all 0s
+- `[low, mid)` is all 1s
+- `[mid, high]` is unprocessed
+- `(high, end)` is all 2s
+
+Understanding the invariant explains when to move `mid` and when not to.
+</details>
+
+```python
+def sortColors(self, nums):
+    low = 0
+    mid = 0
+    high = len(nums) - 1
+
+    while mid <= high:
+        if nums[mid] == 0:
+            nums[mid], nums[low] = nums[low], nums[mid]
+            low += 1
+            mid += 1
+        elif nums[mid] == 1:
+            mid += 1
+        elif nums[mid] == 2:
+            nums[mid], nums[high] = nums[high], nums[mid]
+            high -= 1
+
+    return nums
+```
+
+### 31. Next Permutation
+
+[Leetcode](https://leetcode.com/problems/next-permutation/description)
+
+Transform `nums` in place into the next lexicographically greater permutation. If no such permutation exists, rearrange it into ascending order.
+
+```
+Example 1:
+Input: nums = [1,2,3]
+Output: [1,3,2]
+
+Example 2:
+Input: nums = [3,2,1]
+Output: [1,2,3]
+```
+
+
+<details>
+<summary>Hint</summary>
+The suffix after the pivot is non-increasing; reverse it after the swap.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Find the first index from the right where `nums[i] < nums[i+1]`. Swap it with the smallest larger number in the suffix, then reverse the suffix to make it minimal.
+</details>
+
+```python
+class Solution:
+    def nextPermutation(self, nums: List[int]) -> None:
+        """
+        Do not return anything, modify nums in-place instead.
+        """
+        if len(nums) == 1:
+            return
+
+        i = len(nums) - 2
+        while i >= 0 and nums[i] >= nums[i+1]:
+            i -= 1
+
+        if i >= 0:
+            j = len(nums) - 1
+            while j > i and nums[j] <= nums[i]:
+                j -= 1
+
+            nums[i], nums[j] = nums[j], nums[i]
+
+        k = i + 1
+        l = len(nums) - 1
+        while k <= l:
+            nums[k], nums[l] = nums[l], nums[k]
+            k += 1
+            l -= 1
+```
+
+### 42. Trapping Rain Water
+
+[Leetcode](https://leetcode.com/problems/trapping-rain-water/description)
+
+Given non-negative heights representing bars, compute how much water can be trapped after raining.
+
+```
+Example 1:
+Input: height = [0,1,0,2,1,0,1,3,2,1,2,1]
+Output: 6
+
+Example 2:
+Input: height = [4,2,0,3,2,5]
+Output: 9
+```
+
+
+<details>
+<summary>Hint</summary>
+Water at an index is controlled by the smaller of the best wall on the left and right.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+The water trapped at position `i` is bounded by the highest bar to its left and the highest bar to its right; the water level above bar `i` is `max(min(left_max, right_max) - h[i], 0)`. Two pointers from each end advance the lower side: the side with the smaller running max is the binding constraint, so the water above it is determined.
+</details>
+
+```python
+def trap(self, height):
+    left_max, right_max = 0, 0
+    left, right = 0, len(height) - 1
+    ans = 0
+
+    while left <= right:
+        if left_max < right_max:
+            left_max = max(left_max, height[left])
+            ans += (left_max - height[left])
+            left += 1
+        else:
+            right_max = max(right_max, height[right])
+            ans += (right_max - height[right])
+            right -= 1
+
+    return ans
+```
+
+### 44. Wildcard Matching (Two Pointers)
+
+[Leetcode](https://leetcode.com/problems/wildcard-matching/description)
+
+Given strings `s` and wildcard pattern `p`, determine whether `p` matches all of `s`. Pattern `?` matches one character and `*` matches any sequence, including empty.
+
+```
+Example 1:
+Input: s = "aa", p = "a"
+Output: false
+
+Example 2:
+Input: s = "aa", p = "*"
+Output: true
+```
+
+
+<details>
+<summary>Hint</summary>
+Remember the most recent `*`; on mismatch, let that star consume one more character.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Walk through `s` with `i_s` and `p` with `i_p`. Whenever a `*` is encountered, remember its position and the current position in `s`. If a mismatch happens later, "use" the most recent `*` to consume one more character from `s` and try again. After consuming `s`, any leftover pattern must be all `*` to succeed.
+</details>
+
+```python
+def isMatch(self, s: str, p: str) -> bool:
+    i_s, i_p = 0, 0
+    star_s, star_p = -1, -1
+
+    while i_s < len(s):
+        if i_p < len(p) and p[i_p] == "?":
+            i_s += 1
+            i_p += 1
+        elif i_p < len(p) and p[i_p] == "*":
+            star_s = i_s
+            star_p = i_p
+            i_p += 1
+        elif i_p < len(p) and p[i_p] == s[i_s]:
+            i_s += 1
+            i_p += 1
+        elif star_p != -1:
+            i_p = star_p + 1
+            star_s += 1
+            i_s = star_s
+        else:
+            return False
+
+    while i_p < len(p):
+        if p[i_p] != "*":
+            return False
+        i_p += 1
+
+    return True
+```
+
+The dynamic programming solution can be found under [Dynamic Programming — 44. Wildcard Matching](#dynamic-programming).
+
+## Uncategorized
+
+### 264. Ugly Number II
+
+[Leetcode](https://leetcode.com/problems/ugly-number-ii/description)
+
+An *ugly number* is a positive integer whose prime factors are limited to 2, 3, and 5. Given an integer `n`, return the n-th ugly number.
+
+```
+Example 1:
+Input: n = 10
+Output: 12
+Explanation: [1, 2, 3, 4, 5, 6, 8, 9, 10, 12] is the sequence of the first 10 ugly numbers.
+
+Example 2:
+Input: n = 1
+Output: 1
+```
+
+<details>
+<summary>Hint</summary>
+Generate candidates `2*x`, `3*x`, and `5*x` with three pointers and take the minimum each time.
+</details>
+
+<br />
+
+<details>
+<summary>Approach</summary>
+Any ugly number greater than 1 is a multiplication of 2, 3 and/or 5. Consider three "linked lists", each a series of multiples of 2, 3, or 5 respectively:
+
+```
+Ugly numbers divisible by 2:
+1 -> 1*2 -> 2*2 -> 3*2 -> 4*2 -> ...
+Ugly numbers divisible by 3:
+1 -> 1*3 -> 2*3 -> 3*3 -> 4*3 -> ...
+Ugly numbers divisible by 5:
+1 -> 1*5 -> 2*5 -> 3*5 -> 4*5 -> ...
+```
+
+The problem reduces to merging the three ascending sequences while maintaining monotonicity and removing duplicates, and returning the n-th merged value.
+</details>
+
+```python
+def ugly(self, n):
+    ugly_list = [0] * (n+1)
+    p2, p3, p5 = 1, 1, 1
+    product2, product3, product5 = 1, 1, 1
+    p = 1
+
+    while p <= n:
+        min_val = min(product2, product3, product5)
+        ugly_list[p] = min_val
+
+        if min_val == product2:
+            product2 = ugly_list[p2] * 2
+            p2 += 1
+        if min_val == product3:
+            product3 = ugly_list[p3] * 3
+            p3 += 1
+        if min_val == product5:
+            product5 = ugly_list[p5] * 5
+            p5 += 1
+
+        p += 1
+
+    return ugly_list[n]
+```

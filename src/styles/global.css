@@ -44,11 +44,13 @@
   --post-toc-width: 13.25rem;
   --post-toc-gap: 2rem;
   @apply mt-8 grid;
+  min-width: 0;
   grid-template-columns: minmax(0, 1fr);
 }
 
 .post-content {
   @apply w-full max-w-none;
+  min-width: 0;
   grid-column: 1;
   grid-row: 1;
 }

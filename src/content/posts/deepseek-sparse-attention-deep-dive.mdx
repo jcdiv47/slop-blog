@@ -1,0 +1,231 @@
+---
+author: Opus 4.7
+pubDatetime: 2026-05-18T12:00:00.000Z
+title: "Inside DeepSeek's Sparse Attention: From NSA to DSA"
+slug: deepseek-sparse-attention-deep-dive
+featured: true
+draft: false
+tags:
+  - deep-learning
+  - attention
+  - transformers
+  - deepseek
+  - long-context
+  - paper-review
+description: "A deep dive into DeepSeek's two sparse attention designs — Native Sparse Attention (NSA) and DeepSeek Sparse Attention (DSA) — covering the math, the hardware story, and why DSA in V3.2 looks so different from NSA."
+---
+
+import { Image } from "astro:assets";
+import nsaArchitecture from "@/assets/images/nsa/nsa-architecture.webp";
+
+Two papers from DeepSeek bracket the company's 2025 work on long-context attention: **Native Sparse Attention (NSA)** in February ([arXiv:2502.11089](https://arxiv.org/abs/2502.11089)) and **DeepSeek Sparse Attention (DSA)** shipped inside **DeepSeek-V3.2** in December ([arXiv:2512.02556](https://arxiv.org/abs/2512.02556)). Both attack the same problem — full attention is $O(L^2)$ and unaffordable at the context lengths frontier models now serve — but they reach surprisingly different designs. NSA is a *parallel three-branch* mechanism trained from scratch. DSA is a *single-branch top-$k$ selector* bolted onto an already-trained dense model.
+
+This post walks the math of both, then explains why DSA looks the way it does given that NSA came first.
+
+## Table of contents
+
+## Why sparse attention, and why "native"?
+
+Standard softmax attention computes, for each query $\mathbf{q}_t$ over the prefix $\{\mathbf{k}_s, \mathbf{v}_s\}_{s \le t}$:
+
+$$
+\mathbf{o}_t = \sum_{s \le t} \frac{\exp(\mathbf{q}_t^\top \mathbf{k}_s / \sqrt{d})}{\sum_{s'} \exp(\mathbf{q}_t^\top \mathbf{k}_{s'} / \sqrt{d})} \, \mathbf{v}_s.
+$$
+
+The cost is $O(L^2)$ in both compute and KV traffic. At $L = 64\text{k}$ this dominates the forward pass; at $L = 128\text{k}+$ the KV cache itself becomes a memory-bandwidth problem during decode.
+
+:::aside
+test this is a line in the side note.
+
+This is another line.
+:::
+
+Decade-old observation: the attention matrix is *empirically* sparse — most queries attend non-trivially to a small subset of keys. The natural response is to skip the negligible entries. The trap is that most "skip" strategies (post-hoc pruning, hashing, fixed local+global patterns) are either:
+
+:::aside
+test foo
+
+bar 
+:::
+
+1. **Not trainable end-to-end** — you sparsify a dense-trained model at inference, and the model never learned to live with the sparsity, so quality drops.
+2. **Not hardware-aligned** — the irregular index patterns wreck GPU memory coalescing, so the theoretical FLOP savings don't materialize as wallclock speedup.
+
+NSA's contribution is in the name: *natively* trainable (the sparse pattern is learned during pretraining) and *hardware-aligned* (the selection unit is a contiguous block, sized to match GPU memory transactions). DSA inherits the same two commitments but reshapes them around a different deployment story.
+
+## Part 1 — Native Sparse Attention (NSA)
+
+<figure>
+  <Image src={nsaArchitecture} alt="NSA architecture diagram: three parallel attention branches (compressed, selected, sliding) on the left, with their respective green-shaded attention patterns on the right." />
+  <figcaption>
+    Figure 2 from Yuan et al. (2025), <a href="https://arxiv.org/abs/2502.11089">arXiv:2502.11089</a>. <strong>Left:</strong> the three parallel branches — compressed attention for coarse global context, selected attention for important token blocks, sliding attention for local context. <strong>Right:</strong> the corresponding attention patterns; green = computed, white = skipped.
+  </figcaption>
+</figure>
+
+### The three-branch decomposition
+
+NSA replaces the single attention operator with three parallel branches whose outputs are combined by learned gates:
+
+$$
+\mathbf{o}_t^* = \sum_{c \in \mathcal{C}} g_t^c \cdot \mathrm{Attn}\!\left(\mathbf{q}_t,\, \tilde{K}_t^c,\, \tilde{V}_t^c\right), \qquad \mathcal{C} = \{\text{cmp}, \text{slc}, \text{win}\}.
+$$
+
+Each branch defines its own remapped key/value set $(\tilde{K}_t^c, \tilde{V}_t^c)$. The gates $g_t^c \in [0,1]$ are produced by a small MLP from the hidden state. The three branches are:
+
+- **cmp** — *coarse* attention over a small number of compressed block-summaries (covers the whole prefix).
+- **slc** — *fine* attention over a handful of full-resolution token blocks selected per query (covers the important regions).
+- **win** — *local* sliding-window attention over the last $w$ tokens (covers recent context).
+
+The crucial design choice is that the three branches use **independent K/V**, not a shared set with three masks. The paper argues that a shared K/V would let the easy local-window gradients dominate, preventing the compressed/selected branches from ever learning to do useful work.
+
+### Branch 1: compressed (`cmp`)
+
+Partition the prefix into overlapping blocks of length $l$ with stride $d$ (defaults $l=32$, $d=16$). A learned MLP $\varphi$ — with intra-block positional encoding — compresses each block of $l$ key vectors into a single summary key:
+
+$$
+\tilde{K}_t^{\text{cmp}} = \left\{ \varphi\!\left(\mathbf{k}_{id+1:id+l}\right) \,\middle|\, 1 \le i \le \left\lfloor (t-l)/d \right\rfloor \right\}.
+$$
+
+An identical $\varphi$ (different weights) produces $\tilde{V}_t^{\text{cmp}}$. So instead of attending to $L$ keys, the compressed branch attends to roughly $L/d$ summary tokens — a ~16× reduction. This branch is cheap and globally aware, but lossy.
+
+### Branch 2: selected (`slc`)
+
+This is where the cleverness lives. We want each query to fetch a few *full-resolution* blocks where the action actually is. How do we pick them without spending $O(L)$ per query?
+
+NSA reuses the compressed-branch attention as a free *block importance score*. After the `cmp` branch computes its softmax,
+
+$$
+\mathbf{p}_t^{\text{cmp}} = \mathrm{Softmax}\!\left(\mathbf{q}_t^\top \tilde{K}_t^{\text{cmp}}\right),
+$$
+
+we have one scalar score per compressed block. With a small fixup (because the compression block size $l$ and the selection block size $l'$ — default $l'=64$ — may differ, the cmp-block scores are aggregated/redistributed onto slc-block boundaries; and across a GQA group the per-head scores are summed so all heads in a group select the same blocks), we obtain a per-slc-block score $\mathbf{p}_t^{\text{slc}\prime}$. Then top-$n$:
+
+$$
+\mathcal{I}_t = \left\{ i \,\middle|\, \mathrm{rank}\!\left(\mathbf{p}_t^{\text{slc}\prime}[i]\right) \le n \right\}, \qquad \tilde{K}_t^{\text{slc}} = \mathrm{Cat}\!\left[\, \{\, \mathbf{k}_{i l' + 1\,:\,(i+1)l'} \mid i \in \mathcal{I}_t \,\} \,\right].
+$$
+
+Defaults: $n=16$ selected blocks per query, but with two reservations — 1 block fixed at the very start of the sequence (the "attention sink") and 2 blocks fixed at the local end. So 13 are dynamically chosen by the importance score and 3 are fixed.
+
+Two consequences worth highlighting:
+
+1. **The selector is differentiable upstream.** The block scores come from a softmax that participates in the loss, so gradients flow back through the importance-scoring path even though top-$k$ itself is non-differentiable. The selection *which* is hard; the *whether-to-trust-this-score* is soft.
+2. **Per-GQA-group selection is mandatory for kernels.** If each query head in a group picked its own blocks, the kernel would have to issue different KV loads per head, killing the bandwidth savings that GQA exists for. NSA aggregates scores across heads in a group so the *whole group* shares one $\mathcal{I}_t$. That single decision is what makes the speedups real.
+
+### Branch 3: sliding window (`win`)
+
+Just the trailing $w$ tokens (default $w=512$): $\tilde{K}_t^{\text{win}} = \mathbf{k}_{t-w:t}$. Cheap, dense, and absorbs the easy local-attention gradient that would otherwise corrupt the other two branches' learning.
+
+### Hardware alignment — why blocks, not tokens
+
+Per-token top-$k$ selection produces an unsorted scatter of indices, and a Flash-Attention-style kernel cannot stream contiguous KV tiles from HBM into SRAM if the indices look like `[7, 412, 1188, ...]`. NSA's selection unit is a **block** of $l'=64$ contiguous tokens, chosen so that the SRAM tile size $B_k$ satisfies $B_k \mid l'$. Concretely, the NSA kernel:
+
+- **Group-centric query loading.** Loads all query heads of a GQA group at position $t$ together, $Q \in \mathbb{R}^{h \times d_k}$, since they share $\mathcal{I}_t$.
+- **Shared KV fetching.** Streams the selected blocks $\{K, V\}$ once into SRAM and amortizes them across all heads in the group.
+- **Triton grid scheduling.** Balances arithmetic intensity so the kernel is compute-bound, not bandwidth-bound, even at moderate block counts.
+
+The reported wallclock numbers at 64k context: **~9.0× forward**, **~6.0× backward**, **~11.6× decode** vs dense Flash-Attention. The decode number is largest because decoding is memory-bound and the reduction in KV traffic is the most direct lever there.
+
+### NSA in one picture
+
+For each query you spend:
+
+- $L/d$ attention ops on compressed summaries (always),
+- $n \cdot l'$ attention ops on selected full-res blocks (default $16 \cdot 64 = 1024$),
+- $w$ attention ops on the sliding window (default $512$),
+
+for a total of roughly $L/d + n l' + w \approx L/16 + 1536$ effective KV reads per query — *additive* in $L$ for the compressed branch and *constant* in $L$ for the other two. The model used in the paper is 27B params (3B active MoE), 30 layers, $d_q = d_k = 192$, $d_v = 128$, GQA with 4 groups / 64 heads, pretrained on 270B tokens at 8k length then continued at 32k with YaRN.
+
+## Part 2 — DeepSeek Sparse Attention (DSA) in V3.2
+
+NSA was published in February. By December, DeepSeek shipped V3.2 with a *different* sparse mechanism. Why?
+
+The honest answer is mostly pragmatic. V3 / V3.1-Terminus already exists as a several-hundred-billion-parameter dense-attention MoE that cost a fortune to train. You cannot re-architect its attention into three branches and continue training cheaply — the model has already shaped its representations around the dense operator. DSA is a *minimally invasive* sparsifier: it keeps the existing attention block almost intact and adds a cheap external selector.
+
+### The lightning indexer
+
+DSA's core trick is to factor sparsity out of the attention block. Instead of deriving importance scores *from* attention (as NSA does via the cmp branch), DSA computes them with a separate, dramatically cheaper module — the **lightning indexer**. For each query position $t$ and prefix position $s$:
+
+$$
+I_{t,s} \;=\; \sum_{j=1}^{H^I} w_{t,j}^I \cdot \mathrm{ReLU}\!\left(\mathbf{q}_{t,j}^{I\,\top} \mathbf{k}_s^{I}\right).
+$$
+
+Read this carefully:
+
+- $H^I$ is a *small* number of indexer heads (much smaller than the main attention's head count).
+- $\mathbf{q}_{t,j}^I, \mathbf{k}_s^I \in \mathbb{R}^{d^I}$ are *separate*, low-dimensional projections of the hidden states — not the main attention's Q/K.
+- $w_{t,j}^I$ is a per-token, per-head scalar weight (a tiny linear from $\mathbf{h}_t$).
+- The activation is **ReLU**, not softmax. Two reasons: (i) ReLU is much faster than $\exp$ on tensor cores; (ii) the indexer doesn't need to be a probability distribution — it just needs to rank.
+- The entire indexer is designed to run in **FP8**. At low precision, with ReLU and few heads, the per-pair cost is tiny.
+
+The indexer is still $O(L^2)$ in pair count, but its constant factor is so small that the paper reports it costs much less than the main MLA attention in V3.1-Terminus.
+
+### Top-$k$ selection and the main attention
+
+Given the index scores, DSA picks the top-$k$ keys per query and runs the main attention only over those:
+
+$$
+\mathbf{u}_t \;=\; \mathrm{Attn}\!\left(\mathbf{h}_t,\; \{\, \mathbf{c}_s \mid I_{t,s} \in \mathrm{Top\text{-}}k(I_{t,:}) \,\}\right), \qquad k = 2048.
+$$
+
+Two design choices matter:
+
+1. **$k = 2048$ is per-token, not per-block.** Unlike NSA's blockwise selection, DSA selects individual tokens. The blocking that NSA needed for kernel efficiency is recovered in a different way — through MLA, see below.
+2. **DSA piggybacks on MLA's MQA mode.** V3 already uses Multi-head Latent Attention; in MLA the K/V cache is a single shared *latent* per token rather than per-head K/V projections. So when DSA selects a token, all query heads share the same latent vector — exactly the GQA-style amortization NSA had to engineer manually. This is the architectural reason DSA can afford per-token (rather than per-block) selection.
+
+The main attention's complexity drops from $O(L^2)$ to $O(Lk)$ with $k \ll L$. At $L = 128\text{k}, k = 2048$, that is a ~64× reduction in main-attention FLOPs.
+
+### Two-stage training: KL distillation from a frozen teacher
+
+DSA must not regress the existing model. The training recipe is the most interesting part of the paper and consists of two stages:
+
+**Stage A — dense warm-up (indexer only).** Freeze the entire base model. The main attention still runs *dense*, producing a reference attention distribution. Aggregate the dense attention scores across all query heads and L1-normalize to obtain a per-token target distribution $p_{t,:}$. Train *only* the indexer with a KL objective:
+
+$$
+\mathcal{L}^I \;=\; \sum_t \mathbb{D}_{\mathrm{KL}}\!\left(\, p_{t,:} \,\Big\|\, \mathrm{Softmax}(I_{t,:}) \,\right).
+$$
+
+That is: *teach the indexer to mimic, in score-space, what dense attention attends to.* Recipe: 1,000 steps, ~2.1B tokens, lr $10^{-3}$. The base model never updates during this stage.
+
+**Stage B — sparse training (everything).** Switch the main attention to top-$k$ sparse mode and unfreeze the base model. The KL loss is restricted to the selected positions $\mathcal{S}_t$:
+
+$$
+\mathcal{L}^I \;=\; \sum_t \mathbb{D}_{\mathrm{KL}}\!\left(\, p_{t,\mathcal{S}_t} \,\Big\|\, \mathrm{Softmax}(I_{t,\mathcal{S}_t}) \,\right),
+$$
+
+and the indexer's input is *detached* from the main computational graph, so the indexer is optimized purely by $\mathcal{L}^I$ while the base model is optimized purely by the language-modeling loss. Recipe: 15,000 steps, ~943.7B tokens, lr $7.3 \times 10^{-6}$.
+
+In other words: Stage A makes the indexer a competent imitator of dense attention; Stage B lets the base model gracefully *adapt* to consuming only the indexer's top-$k$ picks, while the indexer keeps refining its imitation on the support it actually picks. Per the paper, V3.2-Exp ends up at parity with V3.1-Terminus on short and long-context evals — with a much cheaper attention at inference.
+
+## Part 3 — NSA vs DSA, side by side
+
+The two designs share a worldview (sparsity should be learned and hardware-friendly) but answer four design questions differently:
+
+| Question | NSA | DSA |
+|---|---|---|
+| Where do importance scores come from? | Compressed-branch attention (reused softmax) | Separate lightning indexer (ReLU, FP8) |
+| Selection granularity | Blocks of $l'=64$ tokens | Individual tokens, $k = 2048$ |
+| How are GQA heads amortized? | Per-group block selection in kernel | Inherited from MLA's latent K/V |
+| When is sparsity learned? | Pretrained natively from scratch | Bolted on via 2-stage continued training |
+| What does the rest of the model see? | Three parallel attention branches with gating | A single attention branch, mostly unchanged |
+
+A useful way to phrase the difference: **NSA designs sparsity into the architecture. DSA designs sparsity onto the architecture.** NSA pays the cost up front (re-pretraining) and gets a richer, multi-resolution attention. DSA pays the cost at the end (continued training) and gets a much smaller diff against an existing dense model — important when the dense model is V3-scale and you cannot afford to throw it away.
+
+There is also a quieter point: DSA's reliance on MLA is what makes its per-token selection viable. NSA's blockwise selection is partly a workaround for *not* having a shared-latent K/V — it forces locality at the granularity where GPU kernels are happy. Once you have MLA, the block constraint relaxes and you can be more surgical. This is a nice example of how lower-level architectural choices (the K/V representation) propagate into upper-level algorithmic ones (how you sparsify).
+
+## Part 4 — What's actually doing the work
+
+A few things stand out across both papers that are worth internalizing beyond the specific designs:
+
+1. **The hard part of "sparse attention" is not the sparsity, it's the gradient.** Top-$k$ is not differentiable. NSA threads gradients through the *scoring* softmax even though the selection itself is not. DSA sidesteps the problem entirely by training the indexer with an *external* KL target derived from a frozen dense teacher. Both are valid; neither is the obvious thing.
+2. **Hardware co-design is non-negotiable.** Both papers spend disproportionate space on memory layout, block size constraints, and kernel scheduling. A sparse pattern that doesn't translate into contiguous KV tiles is, in practice, slower than dense Flash-Attention.
+3. **MLA changed the design space.** Many of the choices in DSA — per-token selection, the small index head dimension, the cheap indexer — are downstream of having a single shared latent per K/V. If you're designing a long-context attention mechanism in 2026, the K/V cache representation is upstream of the sparsity strategy, not orthogonal to it.
+4. **Continued-training recipes are a first-class research artifact now.** The two-stage KL recipe in DSA is the kind of thing that, five years ago, would have been a footnote. It is now the entire point of the paper — because at frontier-model scale, *how* you modify a trained model matters as much as *what* you modify.
+
+## Closing
+
+NSA and DSA are best read together. NSA shows what sparse attention looks like when you have the freedom to design it from scratch; DSA shows what it looks like when you don't, and have to graft it onto a model that the world is already using. The fact that DeepSeek shipped both within a year — and that DSA does not simply *inherit* NSA — is itself the most interesting signal: the right sparsity story depends on the constraints of the model you are training, not just on the asymptotics.
+
+### References
+
+- Yuan, J. et al. *Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.* [arXiv:2502.11089](https://arxiv.org/abs/2502.11089), 2025.
+- DeepSeek-AI. *DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models.* [arXiv:2512.02556](https://arxiv.org/abs/2512.02556), 2025.

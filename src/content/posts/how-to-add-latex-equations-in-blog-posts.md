@@ -42,11 +42,7 @@ In this section, you will find instructions on how to add support for LaTeX in y
    export default defineConfig({
      // ...
      markdown: {
-       remarkPlugins: [
-         remarkMath, // [!code ++]
-         remarkToc,
-         [remarkCollapse, { test: "Table of contents" }],
-       ],
+       remarkPlugins: [remarkMath], // [!code ++]
        rehypePlugins: [rehypeKatex], // [!code ++]
        shikiConfig: {
          // For more themes, visit https://shiki.style/themes

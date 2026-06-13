@@ -10,8 +10,10 @@ import sitemap from "@astrojs/sitemap";
 import remarkToc from "remark-toc";
 import remarkCollapse from "remark-collapse";
 import remarkMath from "remark-math";
+import remarkDirective from "remark-directive";
 import rehypeKatex from "rehype-katex";
 import rehypeKatexHeadingText from "./src/utils/rehypeKatexHeadingText";
+import remarkAsideDirective from "./src/utils/remark-aside-directive";
 import {
   transformerNotationDiff,
   transformerNotationHighlight,
@@ -37,7 +39,13 @@ export default defineConfig({
     },
   },
   markdown: {
-    remarkPlugins: [remarkMath, remarkToc, [remarkCollapse, { test: "Table of contents" }]],
+    remarkPlugins: [
+      remarkMath,
+      remarkToc,
+      [remarkCollapse, { test: "Table of contents" }],
+      remarkDirective,
+      remarkAsideDirective,
+    ],
     // rehypeKatexHeadingText must run after rehypeKatex; see plugin source for why.
     rehypePlugins: [rehypeKatex, rehypeKatexHeadingText],
     shikiConfig: {
@@ -54,6 +62,12 @@ export default defineConfig({
   },
   vite: {
     plugins: [tailwindcss()],
+    server: {
+      allowedHosts: [
+        "blog.h.jiaqicai.com",
+        "jiaqicai.com"
+      ],
+    },
   },
   fonts: [
     {

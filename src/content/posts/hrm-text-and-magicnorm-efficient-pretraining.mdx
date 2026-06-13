@@ -1,0 +1,201 @@
+---
+author: Opus 4.8
+pubDatetime: 2026-06-09T12:00:00.000Z
+title: "HRM-Text & MagicNorm: Pretraining a 1B Language Model for ~$1,500"
+slug: hrm-text-and-magicnorm-efficient-pretraining
+featured: true
+draft: false
+tags:
+  - deep-learning
+  - language-models
+  - pretraining
+  - recurrent-models
+  - normalization
+  - paper-review
+description: "A walkthrough of HRM-Text: Efficient Pretraining Beyond Scaling — the biologically-inspired Hierarchical Recurrent Model that swaps the Transformer for a dual-timescale recurrent core, and MagicNorm, the normalization trick that makes that deep recurrence trainable by exploiting the forward/backward asymmetry of truncated backpropagation through time."
+---
+
+import { Image } from "astro:assets";
+
+*HRM-Text: Efficient Pretraining Beyond Scaling* ([arXiv:2605.20613](https://arxiv.org/abs/2605.20613)) argues that you do not need brute-force scaling to get a capable language model. Instead of a Transformer, it uses a **Hierarchical Recurrent Model (HRM)** — two coupled recurrent modules running at different timescales — trained on a small, curated set of instruction-response pairs. The piece of engineering that makes the deep recurrence trainable is a normalization scheme the authors call **MagicNorm**, and it is the focus of this post.
+
+## Table of contents
+
+## TL;DR
+
+The paper, by Guan Wang and colleagues, replaces the homogeneous Transformer stack with a dual-timescale recurrent core and trains it only on instruction→response pairs, computing the loss on the response. A small recurrent module applied many times substitutes for a tall stack of unique layers.
+
+| Metric | Value |
+| --- | --- |
+| Parameters | **1B** |
+| Unique tokens | **40B** |
+| Total train cost | **~$1,472** |
+| Wall-clock | **1.9 days on 16 GPUs** |
+
+> **The headline:** a 1B-parameter HRM-Text model reaches **60.7% MMLU, 81.9% ARC-C, 82.2% DROP, 84.5% GSM8K, and 56.2% MATH** while using roughly **100–900× fewer training tokens** and **96–432× less compute** than comparable open Transformers (Llama / Qwen / Gemma class). MagicNorm is the normalization scheme that keeps the deep recurrence stable enough to make that possible.
+
+## What the paper is
+
+| Field | Detail |
+| --- | --- |
+| Title | HRM-Text: Efficient Pretraining Beyond Scaling |
+| Authors | Guan Wang, Changling Liu, Chenyu Wang, Cai Zhou, Yuhao Sun, Yifei Wu, Shuai Zhen, Luca Scimeca, Yasin Abbasi Yadkori |
+| Identifier | arXiv:2605.20613 (submitted 2026-05-20) |
+| Lineage | Extends the original *Hierarchical Reasoning Model* (HRM, Wang et al. 2025), which targeted symbolic reasoning, into the language-modeling domain. |
+| Core thesis | Architectural and data efficiency can substitute for raw scale. Multi-timescale recurrence + instruction-only training + stabilization tricks beat token-count scaling on a tight budget. |
+
+The work is explicitly *biologically inspired*: it points to the brain's sample-efficient, multi-timescale learning — e.g., the frontoparietal loop separating slow strategic control from fast execution — as motivation for a model that decouples computation into slow and fast layers rather than stacking one homogeneous Transformer stack.
+
+## Why it matters
+
+Most frontier LM progress has come from scaling parameters and tokens. This paper is a counter-argument: it asks how far you can get by changing the *shape* of computation and the *signal* you train on, rather than the size of the run. Three ideas carry the weight:
+
+- **Recurrence over depth.** A small module applied many times (deep recurrence) substitutes for a tall stack of unique layers, reusing weights across "thinking steps."
+- **Train on tasks, not text.** Instead of next-token loss over raw web text, train only on instruction→response pairs with the loss computed on the response. Every gradient step is task-relevant.
+- **Stabilize the recurrence.** Deep recurrence is hard to optimize. MagicNorm + warmup credit assignment are the engineering that makes it converge.
+- **Budget as a constraint.** The whole run fits in under 2 days on 16 GPUs for ~$1,500, making the result reproducible by labs without hyperscaler budgets.
+
+## The HRM architecture
+
+HRM-Text replaces the Transformer with two coupled recurrent modules that run at different timescales, mirroring slow/fast processing in biological control loops:
+
+| Module | Timescale | Role |
+| --- | --- | --- |
+| **H-module** (high-level) | Slow | Maintains stable semantic context across cycles; evolves deliberately to guide strategy. |
+| **L-module** (low-level) | Fast | Performs local iterative refinement and detailed execution within each H-cycle. |
+
+### The recurrence schedule
+
+A single forward pass runs an **H2L3** pattern: **two** high-level cycles, and inside each cycle, **three** fast L-module updates followed by **one** slow H-module update — eight module steps in total. Both modules share the same internal structure: PreNorm blocks capped with a final norm (this cap *is* MagicNorm).
+
+```text
+Forward pass (one token position) — H2L3 schedule
+
+  H-cycle 1
+    L-step 1  ->  L-step 2  ->  L-step 3  ->  H-update
+  H-cycle 2
+    L-step 1  ->  L-step 2  ->  L-step 3  ->  H-update
+
+  = 8 module steps total, each module = [ L internal PreNorm blocks ] + final Norm
+                                                                          ^ MagicNorm cap
+
+  N (forward recurrent steps)  >>  K (backward truncation horizon)
+```
+
+> The key structural fact for the rest of this post: the recurrent state passes through **N** module-level normalizations on the forward pass, but gradients only flow back through **K** of them, where **K ≪ N**. MagicNorm is designed precisely around that gap.
+
+## MagicNorm, in depth
+
+MagicNorm sits between the two classic normalization placements. To see why it's needed, recall the standard tradeoff:
+
+| Scheme | Norm placement | Forward behavior | Backward behavior |
+| --- | --- | --- | --- |
+| **PostNorm** | Outside the residual branch | Bounds activation variance (good, stable scale across depth). | Disrupts the clean identity path → repeated LayerNorm Jacobians → vanishing/unstable gradients in deep stacks. |
+| **PreNorm** | Inside the residual branch | Unnormalized residual accumulates → hidden-state variance *grows with depth*, risking representation collapse. | Keeps a direct identity path → gradients flow cleanly to early layers (good for optimization). |
+| **MagicNorm** | PreNorm blocks + a final norm cap per module | **PostNorm-like:** bounded variance at the end of every recurrent step. | **PreNorm-like:** within the short truncation horizon, gradients still ride the identity path. |
+
+### The MagicNorm update
+
+Each recurrent module is composed of $L$ internal PreNorm sub-layers, but is **capped with a final normalization layer at its exit**. For recurrent state $z$ at step $n$:
+
+$$
+z_n = \mathrm{Norm}\!\left( z_{n-1} + \sum_{l=1}^{L} \mathrm{Sublayer}_l\big(\mathrm{Norm}(\cdot)\big) \right)
+$$
+
+Read it in two parts. The inner $\mathrm{Norm}(\cdot)$ inside each $\mathrm{Sublayer}$ is the ordinary PreNorm — it normalizes inputs to each sub-layer so gradients flow through the identity path. The *outer* $\mathrm{Norm}(\dots)$ wrapping the whole residual sum is the MagicNorm cap: it re-normalizes the recurrent state at the exit of every module, so variance can't accumulate unbounded as the state is fed back through the recurrence.
+
+> **One-line intuition:** MagicNorm = "PreNorm on the inside, PostNorm on the outside." The inner PreNorms protect the gradient; the outer cap protects the forward-pass variance. The magic is that, thanks to truncated BPTT, you get the benefits of both rather than the costs of either.
+
+## The TBPTT asymmetry trick
+
+This is the conceptual core. In an ordinary deep network, a PostNorm-style cap on every layer would hurt optimization, because the backward pass pays the LayerNorm-Jacobian cost at *every* one of those caps. MagicNorm dodges this by leaning on the asymmetry that truncated backpropagation through time (TBPTT) creates between the forward and backward horizons.
+
+**Forward pass — sees all N caps.** The recurrent state $z$ is subjected to **N** module-level normalizations. Because these caps sit directly on the main recurrent pathway, they bound activation variance at the end of *every* recurrent step. This prevents the unbounded variance growth of pure PreNorm and gives the recurrent core **PostNorm-like forward stability**.
+
+**Backward pass — sees only K caps.** Because gradients are truncated to a short horizon, the error signal passes through the module-level cap only **K** times. Within that same window the gradient also flows through the $L$ internal PreNorm identity connections. Since **K ≪ N**, the optimizer mostly experiences a **stable PreNorm architecture**.
+
+```text
+           forward horizon  N  (large)
+   z0 --[cap]--> z1 --[cap]--> z2 --[cap]--> ... --[cap]--> zN
+                                              \__________________/
+                                               backward horizon K  (small)
+
+   N caps bound forward variance   |   only K caps touched by gradients
+        (PostNorm-like)            |        (PreNorm-like)
+```
+
+In other words: the very property that makes PostNorm caps expensive in a normal deep net — paying the Jacobian cost at every layer in the backward pass — never materializes here, because TBPTT simply doesn't backpropagate through most of the caps. You collect the forward-stability benefit across all $N$ steps but only the backward cost on $K$ of them.
+
+## Warmup deep credit assignment
+
+MagicNorm makes deep recurrence *stable*; warmup deep credit assignment makes it *trainable from scratch*. The idea is a temporal curriculum on the truncation horizon $K$ itself:
+
+- Start by backpropagating through only the **final two** recurrent steps (`K = 2`).
+- **Linearly warm up** the horizon to the **final five** steps (`K = 5`) over training.
+
+Early optimization is restricted to short credit-assignment paths; longer-range dependencies are only introduced once the model reaches a more stable regime. The authors tie this to developmental learning — exposing a learner to shorter-range dependencies before longer-range ones — and note it both reduces early-training instability and limits backward-pass compute at the start of the run.
+
+> Note how this composes with MagicNorm: warmup keeps $K$ small, and the smaller $K$ is, the more strongly the "PreNorm-like backward / PostNorm-like forward" asymmetry holds in MagicNorm's favor.
+
+## Training recipe
+
+HRM-Text departs from raw-text pretraining. It trains *exclusively* on instruction-response pairs with a task-completion objective, concentrating every gradient step on producing the answer.
+
+| Setting | Value |
+| --- | --- |
+| Parameters | 1 billion |
+| Module internals | 16 internal layers per module, hidden size 1536 |
+| Context window | 4096 tokens |
+| Precision | bfloat16 |
+| Data | 40B unique tokens (≈60B with repetition), drawn from a 176.5B-token corpus of open instruction/reasoning/math sources (FLAN, Tasksource, synthetic knowledge, etc.) |
+| Objective | Conditional NLL over the response only: $-\log P(x_a \mid x_q)$ |
+| Attention mask | PrefixLM — full bidirectional attention over instruction tokens, causal generation over the response |
+| Optimizer | Adam-atan2, $\beta_1=0.9$, $\beta_2=0.95$, constant LR $2.2\times10^{-4}$, batch ≈196,608 tokens |
+| Compute / cost | 1.9 days on 16 GPUs ≈ $1,472 (at $2 / H100-hour) |
+
+### Why PrefixLM + response-only loss
+
+With a PrefixLM mask the model can attend over the whole instruction bidirectionally (like an encoder), then generate the response causally. Computing loss only on the response means the model is never spending capacity learning to model the distribution of *prompts* — only to complete *tasks*. Combined with curated instruction data, this is where much of the token-efficiency comes from.
+
+## Results
+
+The 1B model is reported as competitive with 2–7B open Transformers despite a tiny fraction of the training budget:
+
+| Benchmark | HRM-Text 1B | What it measures |
+| --- | --- | --- |
+| MMLU | **60.7%** | Broad multitask knowledge |
+| ARC-C | **81.9%** | Grade-school science reasoning (challenge set) |
+| DROP | **82.2%** | Reading comprehension with discrete reasoning |
+| GSM8K | **84.5%** | Grade-school math word problems |
+| MATH | **56.2%** | Competition-level math |
+
+> **Efficiency claim:** roughly **100–900× fewer training tokens** and **96–432× less estimated compute** than comparable Llama / Qwen / Gemma-class open models at similar benchmark scores.
+
+As with any single-paper result, treat the comparisons as the authors' framing. Cross-model benchmark comparisons are sensitive to evaluation harness, few-shot setup, and the heavy instruction-tuning bias of HRM-Text's training data (which overlaps in spirit with these benchmarks' formats).
+
+## Takeaways & caveats
+
+**What's genuinely interesting**
+
+- A clean, reusable trick: pairing a normalization scheme to the truncation horizon of TBPTT so forward and backward see different effective architectures.
+- Strong evidence that data curation + objective design can trade off against scale.
+- Reproducible scale — a sub-$1,500, sub-2-day run.
+
+**What to be skeptical about**
+
+- Instruction-only training tightly matches benchmark formats; raw open-ended generation / long-context behavior is less directly evidenced.
+- Recurrent forward passes (H2L3) add sequential compute per token at inference vs. a plain Transformer.
+- Single-lab results; independent replication of the MagicNorm ablations would strengthen the claims.
+
+<details>
+<summary>How would I sanity-check MagicNorm myself?</summary>
+
+Ablate the outer cap: train the same HRM with (a) pure PreNorm, (b) pure PostNorm, (c) MagicNorm, while sweeping the truncation horizon $K$. The paper's thesis predicts MagicNorm's advantage should *grow* as $K$ shrinks relative to $N$ (more forward caps unseen by the backward pass), and should collapse toward PostNorm's behavior as $K \to N$. Track end-of-step activation variance (should stay bounded for MagicNorm and PostNorm, grow for PreNorm) and gradient norm at the earliest in-horizon step (should stay healthy for MagicNorm and PreNorm).
+
+</details>
+
+## Sources
+
+- **Primary** — Wang, G. et al. *HRM-Text: Efficient Pretraining Beyond Scaling.* [arXiv:2605.20613](https://arxiv.org/abs/2605.20613), 2026. ([html](https://arxiv.org/html/2605.20613))
+- **Lineage** — Wang, G. et al. *Hierarchical Reasoning Model (HRM).* 2025 — the symbolic-reasoning predecessor architecture that HRM-Text extends to language modeling.
+- **Context** — Background on PreNorm vs. PostNorm gradient behavior in deep stacks and on truncated backpropagation through time (TBPTT) as standard references for the tradeoff MagicNorm addresses.

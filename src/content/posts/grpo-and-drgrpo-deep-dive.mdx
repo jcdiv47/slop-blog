@@ -1,0 +1,545 @@
+---
+author: Opus 4.7
+pubDatetime: 2026-05-28T07:00:00.000Z
+title: "GRPO and Dr.GRPO: The Math, the Biases, and the Fix"
+slug: grpo-and-drgrpo-deep-dive
+featured: true
+draft: false
+tags:
+  - deep-learning
+  - reinforcement-learning
+  - post-training
+  - deepseek
+  - math-reasoning
+  - llm
+  - paper-review
+description: "An end-to-end derivation of Group Relative Policy Optimization (GRPO) from DeepSeekMath and the Dr.GRPO correction from Liu et al. Covers the full objective, the gradient, the two biases (length and question difficulty), the unbiased fix, and the practical recipe behind R1-Zero–style training."
+---
+
+DeepSeek's [GRPO](https://arxiv.org/abs/2402.03300) and the [Dr.GRPO](https://arxiv.org/abs/2503.20783) critique are the two most-cited objects in the post-2024 reasoning-RL literature, and most write-ups about them stop at the one-line slogans — *"PPO without a critic"* and *"GRPO has a length bias"*. Both statements are true, both undersell what is actually going on, and both leave a researcher who wants to ship an R1-Zero–style run with too little to work from.
+
+This post is the long version. We derive **Group Relative Policy Optimization (GRPO)** from the policy gradient, carry every term through to the implementation, locate exactly where the two well-known biases enter, derive **Dr. GRPO** (*"Doctor GRPO"* — *Done Right* GRPO) as the minimal unbiased correction, and compare the two side by side. By the end you should be able to: write either loss from memory; explain why GRPO produces longer *wrong* answers and shorter *right* ones; defend or reject the std-normalization step; and reason about which design knobs matter in practice.
+
+The reader I am writing for has implemented PPO at least once, knows what `logprobs.gather(...)` means, and has skimmed the DeepSeek-R1 report. We will move quickly through the policy-gradient warm-up and spend the bulk of the post on the two algorithms.
+
+## Table of contents
+
+## The setting: RL fine-tuning of a language model
+
+A pretrained language model induces a distribution $\pi_\theta(o \mid q)$ over output sequences $o = (o_1, \dots, o_T)$ given an input prompt $q$. RL fine-tuning treats $\pi_\theta$ as the policy, the prompt as the initial state, each generated token as an action, and the per-trajectory reward $r(q, o)$ as the only learning signal. The optimization problem is
+
+$$
+\max_{\theta}\ J(\theta) \;=\; \mathbb{E}_{q \sim P(Q),\ o \sim \pi_\theta(\cdot \mid q)}\!\bigl[\,r(q, o)\,\bigr],
+$$
+
+possibly with a regularizer against a fixed reference policy $\pi_\text{ref}$ (typically the SFT checkpoint) to prevent the policy from drifting into nonsense.
+
+Three properties of this setting drive every design decision later in the post:
+
+1. **Reward is sparse and terminal.** For verifiable tasks (math with a final numeric answer, code with unit tests), $r(q, o) \in \{0, 1\}$ is determined only after the full sequence is generated. There is no dense per-step reward unless you bolt on a process reward model (PRM), and the moment you do, you inherit a new estimation problem.
+2. **Trajectories are long.** A reasoning chain is hundreds to tens of thousands of tokens; the action space at each step is the full vocabulary; and high-variance Monte-Carlo returns are the norm. Variance reduction matters more than in robotics, not less.
+3. **The policy is a 7B–700B-parameter transformer.** Anything that adds a same-sized value network roughly doubles memory and engineering effort, which is why the literature has been hunting for *critic-free* policy-gradient methods for a decade.
+
+## A two-paragraph PPO refresher
+
+Proximal Policy Optimization solves $\max_\theta J(\theta)$ by repeated importance-weighted gradient updates. Given a behavior policy $\pi_{\theta_\text{old}}$ that produced the rollouts and a per-token advantage estimate $\widehat{A}_t$, PPO minimizes the *negative* of
+
+$$
+J_\text{PPO}(\theta) \;=\; \mathbb{E}_{\,o \sim \pi_{\theta_\text{old}}}\!\left[\,\frac{1}{T}\sum_{t=1}^{T}\,\min\!\bigl(\,\rho_t(\theta)\,\widehat{A}_t,\;\mathrm{clip}(\rho_t(\theta),\,1-\varepsilon,\,1+\varepsilon)\,\widehat{A}_t\,\bigr)\right],
+$$
+
+where the *importance ratio* per token is
+
+$$
+\rho_t(\theta) \;=\; \frac{\pi_\theta(o_t \mid q, o_{<t})}{\pi_{\theta_\text{old}}(o_t \mid q, o_{<t})}.
+$$
+
+The clip term and the $\min$ together cap how far each step can change the policy: when $\widehat{A}_t > 0$, increases of $\rho_t$ are throttled at $1+\varepsilon$; when $\widehat{A}_t < 0$, decreases of $\rho_t$ are throttled at $1-\varepsilon$. The advantage estimate $\widehat{A}_t$ in vanilla PPO is generalized advantage estimation (GAE) on top of a *learned critic* $V_\phi(s_t)$ — and that critic is the friction point GRPO is designed to remove. The reference-policy KL term, often written separately as $-\beta\,\mathrm{KL}[\pi_\theta \,\|\, \pi_\text{ref}]$ (either added inside the reward as a per-token penalty or as a stand-alone loss term), keeps the policy near $\pi_\text{ref}$.
+
+The two facts to carry forward: PPO clips on the ratio, and PPO needs an external estimate of the advantage.
+
+## Part 1 — Group Relative Policy Optimization (GRPO)
+
+GRPO was introduced in the DeepSeekMath paper (Shao et al., [arXiv:2402.03300](https://arxiv.org/abs/2402.03300)) and became famous a year later as the workhorse of DeepSeek-R1 ([arXiv:2501.12948](https://arxiv.org/abs/2501.12948)). The slogan version is *"PPO with the critic replaced by a Monte-Carlo group baseline."* The interesting content is in how the group baseline is constructed and how the loss is averaged.
+
+### The core idea: replace the critic with a stochastic per-prompt baseline
+
+For a given prompt $q$, sample a *group* of $G$ completions $\{o_i\}_{i=1}^G$ from the behavior policy $\pi_{\theta_\text{old}}(\cdot \mid q)$. Score each completion to get a scalar reward $r_i = r(q, o_i)$. Then form the within-group baseline as the empirical mean and (optionally) normalize by the empirical standard deviation:
+
+$$
+\widehat{A}_i \;=\; \frac{r_i - \mathrm{mean}(\{r_j\}_{j=1}^{G})}{\mathrm{std}(\{r_j\}_{j=1}^{G})}.
+$$
+
+Every token of completion $o_i$ gets the same trajectory-level advantage $\widehat{A}_{i,t} \equiv \widehat{A}_i$ — there is no per-token credit assignment in outcome-supervised GRPO. The intuition is clean: a completion that beats its group siblings on the same prompt should be reinforced; one that loses should be suppressed; the average tells you nothing because the average has already been subtracted out.
+
+This is a Rao-Blackwell-flavored move. The optimal control-variate baseline for a REINFORCE estimator is the conditional expectation of the return given the state, $b(s) = \mathbb{E}[R \mid s]$. A learned critic $V_\phi(s)$ approximates this; a fresh Monte-Carlo average over $G$ samples *also* approximates it, with no parameters and no separate training. The cost is variance — a $G$-sample mean has variance $\sigma^2/G$ — but the benefit is that the baseline is *exact in expectation* (no value-function bias) and requires no extra forward/backward pass.
+
+:::aside
+Why not just use a per-prompt running average across the whole training run? Because the reward distribution drifts as the policy improves. A per-rollout group keeps the baseline calibrated to the *current* policy's behavior on *this specific* prompt. The cost is that $G$ samples per question is now part of your compute budget.
+:::
+
+### The full GRPO objective
+
+The DeepSeekMath paper writes the GRPO objective as
+
+$$
+\begin{aligned}
+J_\text{GRPO}(\theta) \;=\; \mathbb{E}_{\,q \sim P(Q),\ \{o_i\}_{i=1}^G \sim \pi_{\theta_\text{old}}(\cdot \mid q)}\!\Bigg[\ &\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|o_i|}\sum_{t=1}^{|o_i|}\Big\{\\
+&\quad \min\!\bigl(\,\rho_{i,t}(\theta)\,\widehat{A}_{i,t},\;\mathrm{clip}(\rho_{i,t}(\theta),\,1-\varepsilon,\,1+\varepsilon)\,\widehat{A}_{i,t}\,\bigr)\\
+&\quad -\;\beta\,D_\text{KL}\!\bigl[\,\pi_\theta(\cdot \mid q, o_{i,<t})\ \big\|\ \pi_\text{ref}(\cdot \mid q, o_{i,<t})\,\bigr]\Big\}\ \Bigg],
+\end{aligned}
+$$
+
+with the per-token ratio
+
+$$
+\rho_{i,t}(\theta) \;=\; \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_\text{old}}(o_{i,t} \mid q, o_{i,<t})}.
+$$
+
+There are five design choices baked into this expression. Each is worth pulling out separately because each is the locus of a future critique.
+
+1. **Group-relative advantage.** $\widehat{A}_{i,t}$ is computed from the within-group statistics of the $G$ siblings of $o_i$.
+2. **Per-token PPO clipping.** Each token contributes one min-of-clip term, just as in PPO; the importance ratio $\rho_{i,t}$ is per-token, even though $\widehat{A}_{i,t}$ is constant along $i$.
+3. **Per-sample length normalization.** The inner sum is divided by $|o_i|$, so each *sample* contributes the average per-token quantity. This is the place where the length bias enters; we will come back to it.
+4. **KL as a loss term, not a reward modifier.** PPO traditionally folds the per-token reference KL into the reward signal (subtracting $\beta \log(\pi_\theta/\pi_\text{ref})$ at each token before computing returns). GRPO factors the KL *out of the reward* and into a separate loss term, computed with an unbiased low-variance estimator (see below). This means the advantage $\widehat{A}_{i,t}$ is computed purely from the task reward and is unaffected by the regularizer.
+5. **Group averaging.** The outer $\tfrac{1}{G}\sum_i$ gives equal weight to each sample in the group regardless of length.
+
+### The KL estimator GRPO uses
+
+The KL term in GRPO is the *forward* KL $\mathrm{KL}[\pi_\theta \,\|\, \pi_\text{ref}]$ — pulling $\pi_\theta$ toward $\pi_\text{ref}$ — estimated by Schulman's *k3* estimator:
+
+$$
+\widehat{\mathrm{KL}}_{i,t} \;=\; \frac{\pi_\text{ref}(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}\;-\;\log\!\frac{\pi_\text{ref}(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}\;-\;1.
+$$
+
+This is non-negative for all inputs (since $\log x \le x - 1$ with equality at $x=1$), it is an unbiased estimator of the true KL when the expectation is taken over $o_{i,t} \sim \pi_\theta$, and it has lower variance than the naive estimator $\log(\pi_\theta/\pi_\text{ref})$ that the per-token log-ratio gives you. In practice you compute it from per-token log-probs on the rollout:
+
+```python
+# log_pi_theta and log_pi_ref are shape (B, T) per-token log-probs.
+log_ratio = log_pi_ref - log_pi_theta
+kl_per_tok = torch.exp(log_ratio) - log_ratio - 1.0
+```
+
+Note the direction: $\log \pi_\text{ref} - \log \pi_\theta$, *not* the other way around. Swapping the sign turns it into an estimator of $\mathrm{KL}[\pi_\text{ref} \,\|\, \pi_\theta]$, which has different optimization geometry (mode-seeking vs. mass-covering) and is *not* the regularizer DeepSeekMath used.
+
+### Process supervision: when the reward is per-step
+
+For tasks where a process reward model (PRM) gives an intermediate reward at the end of each reasoning step $k$ within $o_i$ — say at token index $\mathrm{idx}(i, k)$ with reward $r_i^{(k)}$ — GRPO defines the per-token advantage as a discount-free sum-of-future-step-rewards minus the group baseline. Concretely, after computing within-group statistics over the *full set of step rewards across all $G$ samples*,
+
+$$
+\tilde{r}_i^{(k)} \;=\; \frac{r_i^{(k)} - \mathrm{mean}(\{r_j^{(\ell)}\})}{\mathrm{std}(\{r_j^{(\ell)}\})},
+$$
+
+the per-token advantage is the cumulative sum of normalized step rewards from the current token forward,
+
+$$
+\widehat{A}_{i,t} \;=\; \sum_{k\,:\,\mathrm{idx}(i,k)\,\ge\,t} \tilde{r}_i^{(k)}.
+$$
+
+This is the only place in GRPO where $\widehat{A}_{i,t}$ varies with $t$ within a single sample. For outcome supervision — the dominant case in R1-Zero–style runs — process supervision is not used and the advantage is constant along the trajectory.
+
+### What GRPO is actually optimizing: a gradient walk-through
+
+Take the gradient of the un-clipped, un-KL'd version of the loss (the clip is just a piecewise-affine correction that is zero on the active set):
+
+$$
+\nabla_\theta J_\text{GRPO}^{\text{(plain)}}(\theta) \;=\; \mathbb{E}_q\!\left[\,\frac{1}{G}\sum_{i=1}^G \frac{1}{|o_i|}\sum_{t=1}^{|o_i|} \rho_{i,t}\,\widehat{A}_{i,t}\,\nabla_\theta \log \pi_\theta(o_{i,t} \mid q, o_{i,<t})\,\right].
+$$
+
+When $\theta = \theta_\text{old}$ the ratio $\rho_{i,t} = 1$ and this collapses to
+
+$$
+\nabla_\theta J_\text{GRPO}^{\text{(plain)}}\Big|_{\theta = \theta_\text{old}} \;=\; \mathbb{E}_q\!\left[\,\frac{1}{G}\sum_{i=1}^G \frac{\widehat{A}_i}{|o_i|}\sum_{t=1}^{|o_i|} \nabla_\theta \log \pi_\theta(o_{i,t} \mid q, o_{i,<t})\,\right].
+$$
+
+(Outcome supervision, so $\widehat{A}_{i,t} \equiv \widehat{A}_i$ pulls out of the inner sum.)
+
+Two things to read off this expression:
+
+- The gradient direction for sample $i$ is the sum-of-token-log-prob gradients $\nabla_\theta \sum_t \log \pi_\theta(o_{i,t} \mid \dots)$ — exactly the gradient of the *sequence* log-likelihood. So sample $i$ pushes the policy toward (or away from) producing this whole sequence.
+- The *magnitude* per sample is $\widehat{A}_i / |o_i|$. This is the crucial term. A sequence of length 1000 with $\widehat{A}_i = +1$ contributes the same total log-likelihood-gradient magnitude as a sequence of length 100 with $\widehat{A}_i = +1$. *Per token*, the long sequence is updated 10× more weakly.
+
+That last observation is where Dr. GRPO will eventually drive a stake. Hold it in your head; we will use it in Part 2.
+
+### The compute story: why a critic-free design matters
+
+The headline numbers are easy. A 70B-parameter actor with a same-size 70B critic doubles parameter memory; adds a full second forward/backward at each optimizer step; doubles optimizer state (the critic also needs Adam moments); and complicates rollout pipelining because the critic needs the same prefix tokens the actor produced. Critic learning is also fragile in language-model RL — the value function has to track a non-stationary distribution over very long sequences, and small bias in $V_\phi$ leaks into $\widehat{A}_t$ and then into the policy.
+
+GRPO buys you:
+
+- **No critic parameters, no critic optimizer state.** Memory and engineering both shrink.
+- **No value-function bias.** Group mean is an unbiased baseline; the resulting advantage estimate has zero baseline bias by construction. The cost is $G\times$ rollouts per prompt, which is its own line item but is *parallelizable* in a way critic training is not.
+- **Simpler rollout pipeline.** No need to align critic forward passes with actor rollouts; the only thing you need is the group of sibling completions and their scalar rewards.
+
+This is the cost-benefit that made GRPO the default in R1-style runs. The tradeoff is that you now spend compute on extra rollouts instead of on a critic. For verifiable-reward tasks where the reward function is a fast rule-based check (math grader, code unit test), the rollout cost is roughly the cost of $G$ extra forward passes per prompt — much cheaper than maintaining a 70B critic.
+
+### A concrete GRPO step, with shapes
+
+Let me walk a single optimizer step end-to-end. Say the batch contains $B$ prompts, each with $G$ completions, each of length up to $L_\text{max}$. Tensors are padded to $L_\text{max}$ and masked.
+
+1. **Sample.** For each prompt $q_b$, sample $G$ completions $\{o_{b,i}\}_{i=1}^G$ from $\pi_{\theta_\text{old}}$. Store the *old log-probs* $\log \pi_{\theta_\text{old}}(o_{b,i,t} \mid \dots)$ as a tensor of shape $(B, G, L_\text{max})$.
+2. **Score.** Run the reward function on each completion to get scalar rewards $r_{b,i}$ of shape $(B, G)$.
+3. **Baseline.** For each prompt, compute $\mu_b = \mathrm{mean}_i(r_{b,i})$ and $\sigma_b = \mathrm{std}_i(r_{b,i})$. Form $\widehat{A}_{b,i} = (r_{b,i} - \mu_b) / (\sigma_b + \epsilon)$ of shape $(B, G)$, then broadcast along the token axis to get a per-token advantage of shape $(B, G, L_\text{max})$.
+4. **Reference log-probs.** Run a forward pass of $\pi_\text{ref}$ on the same completions to get $\log \pi_\text{ref}$ of shape $(B, G, L_\text{max})$.
+5. **Policy forward.** Run $\pi_\theta$ to get current log-probs and compute the per-token ratio $\rho = \exp(\log \pi_\theta - \log \pi_{\theta_\text{old}})$.
+6. **Surrogate loss.** For each $(b, i, t)$ that is a real (non-pad) completion token, compute
+   $$
+   \ell_{b,i,t} \;=\; -\,\min\!\bigl(\rho_{b,i,t}\,\widehat{A}_{b,i,t},\,\mathrm{clip}(\rho_{b,i,t},1-\varepsilon,1+\varepsilon)\,\widehat{A}_{b,i,t}\bigr) \;+\; \beta\,\widehat{\mathrm{KL}}_{b,i,t}.
+   $$
+7. **Length-normalize per sample.** Sum $\ell_{b,i,t}$ over $t$ from $1$ to $|o_{b,i}|$ and divide by $|o_{b,i}|$. Call this $\bar\ell_{b,i}$.
+8. **Group- and batch-average.** Sum over $i$ and divide by $G$, then sum over $b$ and divide by $B$. This is the GRPO loss.
+9. **Backprop and step.** Standard.
+
+Two things to be careful about in step 7:
+
+- The division is by $|o_{b,i}|$, the *true* sequence length, not by $L_\text{max}$. Padding tokens get masked out before the sum so that masked positions contribute zero.
+- If you implement this as "average over all valid tokens in the whole batch" — that is, flatten everything to $(B\cdot G\cdot L_\text{max})$ and take a plain mean over the masked valid positions — you get a *different* loss. The GRPO normalization is per-sample-then-per-group, which is a strictly stronger commitment about how each sample contributes.
+
+### The rule-based reward in R1-Zero
+
+R1-Zero uses GRPO with a rule-based reward function: $r(q, o) = 1$ if the model's final boxed answer matches the gold answer, else $0$ (plus, in some variants, a small format reward for emitting `<think>`/`<answer>` tags). No PRM, no reward model, no human preferences. This is the recipe that produced the eye-popping AIME and MATH numbers in the R1 report — and it is also the recipe whose biases Dr. GRPO went after.
+
+Sampling temperature for the $G$ rollouts is typically 1.0; group size $G$ is typically 16–64; the reference policy $\pi_\text{ref}$ is the SFT (or base) checkpoint at the start of RL and is *frozen* for the duration of training; $\beta$ is small (e.g. $10^{-3}$ to $10^{-2}$).
+
+## Part 2 — The Dr. GRPO critique
+
+Liu et al. ("Understanding R1-Zero-like Training: A Critical Perspective", [arXiv:2503.20783](https://arxiv.org/abs/2503.20783)) take the GRPO objective at face value, write out the gradient, and identify *two* terms that introduce systematic bias relative to the policy gradient one would get if the goal were purely to maximize the expected task reward. Both biases are mild from a "does training work" perspective — GRPO clearly does work — but they shape behavior in ways that researchers using R1-Zero–style training need to know about. After identifying the biases the authors propose **Dr. GRPO**, where "Dr." stands for *Done Right* — the minimal correction that removes both biases without giving up the critic-free, group-relative structure.
+
+### Bias 1 — The per-sample length normalization
+
+Recall the GRPO gradient at $\theta = \theta_\text{old}$:
+
+$$
+\nabla_\theta J_\text{GRPO}^{\text{(plain)}} \;\propto\; \sum_i \frac{\widehat{A}_i}{|o_i|} \sum_t \nabla_\theta \log \pi_\theta(o_{i,t} \mid \dots).
+$$
+
+The expected policy-gradient direction — the unbiased REINFORCE-with-baseline estimator that we *want* — is
+
+$$
+\nabla_\theta J^\star \;=\; \mathbb{E}_q\!\left[\sum_i \widehat{A}_i \sum_t \nabla_\theta \log \pi_\theta(o_{i,t} \mid \dots)\right],
+$$
+
+with *no* per-sample length factor. The GRPO version weights each sample's gradient contribution by $1/|o_i|$. That extra factor is the length bias.
+
+The consequence depends on the sign of $\widehat{A}_i$:
+
+- **Positive advantage (correct sample).** The token-level reinforcement strength is $\widehat{A}_i / |o_i|$. A *long correct* sample is reinforced more weakly per token than a *short correct* one with the same scalar reward. Net effect: among samples that get the right answer, brevity is rewarded — the policy is pushed toward shorter correct chains.
+- **Negative advantage (wrong sample).** The per-token *suppression* strength is also $|\widehat{A}_i| / |o_i|$. A *long wrong* sample is penalized more weakly per token than a *short wrong* one. Net effect: among samples that get the wrong answer, length is *not penalized* — the policy is freer to ramble when it's about to be wrong.
+
+The two effects compose into the empirical pattern Liu et al. document: under GRPO, *correct* response length tends to *decrease* over training while *wrong* response length tends to *increase*. The model learns to keep its right answers tight and its wrong answers long. This is bad from a compute standpoint (you pay more tokens for the responses that are also useless), bad from an evaluation standpoint (average response length goes up but conditional-on-correct length goes down, so the headline "test-time compute scaling" curve is partly a length-bias artifact), and bad from an interpretability standpoint (verbose wrong chains-of-thought are exactly the failure mode you would like to discourage).
+
+The mechanism is worth restating once more, because it surprised me the first time I worked through it. The GRPO designers presumably chose to divide by $|o_i|$ for the intuitive reason that you want each *sample* to contribute equally to the loss regardless of how long it is. But "equal contribution to the loss" and "equal contribution to the gradient direction" are not the same thing in policy gradient. The thing you want equal across samples is the *signed log-likelihood-gradient magnitude*, not the *per-token average*. Dividing by $|o_i|$ chooses the latter and asymmetrizes long vs. short samples in exactly the way described above.
+
+### Bias 2 — The std-of-rewards normalization
+
+The other place GRPO normalizes is in the advantage formula:
+
+$$
+\widehat{A}_i \;=\; \frac{r_i - \mu_q}{\sigma_q + \epsilon},\quad \mu_q = \mathrm{mean}_i(r_i),\ \ \sigma_q = \mathrm{std}_i(r_i).
+$$
+
+The dividing by $\sigma_q$ looks innocuous — it's a per-group "z-scoring" that you might justify as variance normalization across questions of different difficulty. It is not innocuous. Consider what $\sigma_q$ measures. For a binary reward $r \in \{0, 1\}$ and an empirical pass rate $\hat{p}_q = \mathrm{mean}_i(r_i)$ on prompt $q$, the empirical standard deviation is
+
+$$
+\sigma_q \;=\; \sqrt{\hat{p}_q(1-\hat{p}_q)}.
+$$
+
+This is *small* when $\hat{p}_q$ is near 0 or 1 (i.e., the question is very easy or very hard for the current policy) and *large* near $\hat{p}_q = 1/2$. The advantage magnitude $|\widehat{A}_i| = |r_i - \mu_q| / \sigma_q$ becomes:
+
+- $\hat{p}_q$ near 0 (mostly wrong group): a rare correct sample has $|r_i - \mu_q| = 1 - \hat{p}_q \approx 1$, but $\sigma_q \approx \sqrt{\hat{p}_q}$ is small, so $|\widehat{A}_i| \approx 1/\sqrt{\hat{p}_q}$ — large. The rare correct sample on a hard question gets a *huge* gradient.
+- $\hat{p}_q$ near 1 (mostly correct group): a rare wrong sample similarly gets $|\widehat{A}_i| \approx 1/\sqrt{1-\hat{p}_q}$ — large. The rare mistake on an easy question gets a *huge* gradient.
+- $\hat{p}_q$ near 1/2: $\sigma_q \approx 1/2$ and $|\widehat{A}_i| \approx 1$ — a moderate gradient on balanced questions.
+
+In short: the std-normalization *up-weights* questions on which the current policy is near-deterministic (either succeeding nearly always or failing nearly always) and *down-weights* questions on which it is genuinely undecided. This is the opposite of what a curriculum-aware optimizer wants. The questions where learning is most useful are the ones near the policy's edge of competence — questions at $\hat{p}_q \approx 1/2$, where there is genuine variance in outcomes and the gradient signal is clean. The std-normalization actively suppresses those.
+
+The bias is amplified by interaction with bias 1. Hard questions tend to produce *long* responses (the model thinks longer when it's confused), so the rare correct sample on a hard question is *also* a long sample — its $1/|o_i|$ factor partially offsets the inflated $1/\sigma_q$, but only partially, and the net is still a big gradient on a long noisy trajectory. Easy questions tend to produce *short* responses, so the rare wrong sample on an easy question is short and its inflated $1/\sigma_q$ is *not* offset — easy-question mistakes get pile-driven into the loss. The asymmetry compounds.
+
+### Why the std term was tempting
+
+It is worth pausing on why the std-normalization is in GRPO at all, because the temptation is the kind a careful reader needs to inoculate against.
+
+Z-scoring the advantage is the standard advice for "improving the conditioning of the loss" — equivalently, decoupling the advantage scale from the reward scale. If you change your reward from $\{0, 1\}$ to $\{0, 10\}$, the un-normalized advantage scales by 10 and you have to retune $\beta$, the learning rate, and the clip threshold. The z-scoring makes the algorithm scale-invariant in $r$.
+
+That is a real benefit. The mistake is treating the *group* as the right scope for the scale normalization. Dividing by an *across-prompt* running std would normalize for reward scale without the question-difficulty bias. Dividing by a *within-group* std normalizes for both, and the second normalization is the one that introduces the bias.
+
+Dr. GRPO simply removes the std term. If you want reward-scale invariance, you can add a separate running normalization at the dataset level, or — as is standard in R1-Zero-style runs — fix the reward to $\{0, 1\}$ in the first place and never worry about scale.
+
+### Dr. GRPO: the unbiased objective
+
+The Dr. GRPO objective drops both normalizers:
+
+$$
+\begin{aligned}
+J_\text{Dr.GRPO}(\theta) \;=\; \mathbb{E}_{\,q \sim P(Q),\ \{o_i\}_{i=1}^G \sim \pi_{\theta_\text{old}}}\!\Bigg[\ &\frac{1}{G\,L_\text{norm}}\sum_{i=1}^{G}\sum_{t=1}^{|o_i|}\Big\{\\
+&\quad \min\!\bigl(\,\rho_{i,t}\,\widehat{A}_i^\text{Dr},\;\mathrm{clip}(\rho_{i,t},\,1-\varepsilon,\,1+\varepsilon)\,\widehat{A}_i^\text{Dr}\,\bigr)\\
+&\quad -\;\beta\,\widehat{\mathrm{KL}}_{i,t}\Big\}\ \Bigg],
+\end{aligned}
+$$
+
+with the de-z-scored advantage
+
+$$
+\widehat{A}_i^\text{Dr} \;=\; r_i - \mathrm{mean}_j(r_j)
+$$
+
+and a *constant* length normalizer $L_\text{norm}$ — typically the model's maximum generation length — so the per-token contribution is no longer sample-length-dependent.
+
+The two changes:
+
+- $1/|o_i| \;\to\; 1/L_\text{norm}$. Each token now contributes its policy gradient *with the same weight*, regardless of which sample (and therefore which length) it came from. Long correct samples are no longer under-reinforced; long wrong samples are no longer under-penalized.
+- $\widehat{A}_i = (r_i - \mu_q)/(\sigma_q + \epsilon) \;\to\; \widehat{A}_i^\text{Dr} = r_i - \mu_q$. Question-difficulty weighting is now flat: a question at $\hat{p}_q = 1/2$ contributes as much as a question near the policy's edge.
+
+The constant $L_\text{norm}$ is essentially a learning-rate-folding constant; it scales the loss uniformly and can be absorbed into $\beta$ and the optimizer step size. The Dr. GRPO paper sets it to the maximum generation length so that the gradient magnitude on a single token is the same scale it would be under a raw token-level REINFORCE estimator.
+
+The KL term is unchanged. The clipping is unchanged. The group sampling is unchanged. What changed is the two places where bias entered.
+
+### A symbolic comparison of the two gradients
+
+Compare the per-token policy gradient contribution from sample $i$, at $\theta = \theta_\text{old}$:
+
+$$
+\text{GRPO:}\quad \frac{1}{G}\cdot \frac{1}{|o_i|}\cdot \frac{r_i - \mu_q}{\sigma_q + \epsilon}\,\cdot\,\nabla_\theta \log \pi_\theta(o_{i,t} \mid \dots).
+$$
+
+$$
+\text{Dr.\,GRPO:}\quad \frac{1}{G\,L_\text{norm}}\cdot (r_i - \mu_q)\,\cdot\,\nabla_\theta \log \pi_\theta(o_{i,t} \mid \dots).
+$$
+
+The Dr. GRPO version is exactly the REINFORCE-with-baseline policy gradient for the group-mean baseline, up to a constant factor $1/(G\,L_\text{norm})$ that does not depend on sample, length, or difficulty. The GRPO version multiplies this by a sample-dependent $L_\text{norm}/(|o_i|\,(\sigma_q + \epsilon))$. The factor is the bias term.
+
+### Empirical signatures of the fix
+
+The Liu et al. paper reports several behavioral changes after switching from GRPO to Dr. GRPO under matched compute on R1-Zero–style runs:
+
+- **Response length stops growing with training step.** Under GRPO, average response length grows monotonically over training; under Dr. GRPO it stabilizes after the first few thousand steps. The growing length under GRPO is *not* an emergent test-time-compute behavior — it is the bias 1 artifact made visible.
+- **Correct response length stays close to wrong response length.** Under GRPO, $\mathbb{E}[|o| \mid \text{wrong}] - \mathbb{E}[|o| \mid \text{correct}]$ grows with training. Under Dr. GRPO it stays near zero.
+- **Pass-rate at fixed compute budget improves.** Because Dr. GRPO doesn't spend gradient on length-pumping wrong responses, it converges to better pass@1 on AIME and MATH at the same number of update steps and the same wallclock.
+- **Easy and hard questions train similarly.** Under GRPO, easy and hard questions (low and high $\hat{p}_q$ respectively) dominate the gradient. Under Dr. GRPO the gradient mass shifts back to balanced-difficulty questions where most of the signal is.
+
+The accuracy improvement is real but moderate — a couple of points on AIME, less on simpler benchmarks. The compute and length improvements are bigger and arguably more important, because they take the *interpretability* of an R1-Zero run from "longer outputs $=$ better thinking" to "shorter, more honest outputs that we can read."
+
+## Part 3 — A side-by-side comparison
+
+I'll lay the two algorithms out as a table so the differences are scannable, then walk through what each choice means.
+
+| Component | PPO | GRPO | Dr. GRPO |
+|---|---|---|---|
+| Baseline for advantage | Learned critic $V_\phi(s_t)$ | $\mu_q = \mathrm{mean}_i r_i$ across $G$ siblings | $\mu_q = \mathrm{mean}_i r_i$ across $G$ siblings |
+| Advantage formula | GAE on $V_\phi$ | $(r_i - \mu_q)/(\sigma_q + \epsilon)$, broadcast | $r_i - \mu_q$, broadcast |
+| Per-token credit assignment | Yes, via GAE | No (constant along trajectory) | No (constant along trajectory) |
+| Length normalization | $1/T$ over all tokens in batch | $1/|o_i|$ per sample, then $1/G$ over group | $1/L_\text{norm}$ (constant), then $1/G$ over group |
+| KL regularizer placement | Per-token, inside reward | Separate loss term, $k3$ estimator | Separate loss term, $k3$ estimator |
+| Clipping | Per-token PPO clip on $\rho_t$ | Per-token PPO clip on $\rho_{i,t}$ | Per-token PPO clip on $\rho_{i,t}$ |
+| Extra parameters | Same-size critic | None | None |
+| Rollouts per prompt | 1 (uses critic) | $G$ (typically 16–64) | $G$ (typically 16–64) |
+| Length bias | None | Yes — favors short correct, long wrong | None |
+| Difficulty bias | None | Yes — up-weights $\hat{p}_q \in \{0, 1\}$ tails | None |
+| Per-prompt baseline variance | Low (smooth critic) | $\sigma^2/G$ Monte-Carlo | $\sigma^2/G$ Monte-Carlo |
+| Reward-scale invariance | Via GAE normalization | Yes (via $\sigma_q$) | No — set reward to $\{0,1\}$ or normalize externally |
+
+A few things worth saying about the entries.
+
+### "No per-token credit assignment"
+
+Both GRPO and Dr. GRPO assign the same scalar advantage to every token of a given sample. This is fine because the reward is terminal in the outcome-supervised setting — there is no honest per-step signal to assign. PPO+GAE assigns per-token advantages by bootstrapping from $V_\phi$, but the per-token credit is *fictitious* in the same sense that the critic is fictitious: it is a learned approximation of "what the future reward will be," and for long reasoning chains it can be quite noisy.
+
+Constant-along-trajectory advantage *is* a kind of credit assignment by way of the sequence-level log-likelihood gradient. Each token's gradient is
+
+$$
+\nabla_\theta \log \pi_\theta(o_t \mid \dots) \cdot \widehat{A}_i,
+$$
+
+and the *automatic* token-wise distribution is what the model's own log-prob structure gives you. Tokens the model already finds easy (high baseline log-prob) have small gradient norm; tokens it finds surprising have large gradient norm. So the credit assignment exists, it just lives in the geometry of the log-likelihood, not in a separate value head.
+
+### "Reward-scale invariance"
+
+GRPO's $\sigma_q$ normalization gives you per-question reward-scale invariance for free; Dr. GRPO removes it. In practice this matters less than it might sound:
+
+- For binary $\{0,1\}$ rewards the scale is fixed by construction.
+- For mixed rewards (e.g. format reward $+$ correctness reward), you can normalize at the *dataset* level by tracking running mean/std of $r$ across prompts and seasons — which is the standard advice in PPO-LLM stacks anyway.
+
+The Dr. GRPO authors' position is that paying the difficulty-bias cost to buy per-prompt scale-invariance is a poor trade, and that downstream tooling (clip $\varepsilon$, learning rate, $\beta$) is easier to tune than the bias is to correct after the fact.
+
+### "Rollouts per prompt"
+
+This is the line item where critic-free methods spend their compute. With $G = 16$ and a 200B-active-parameter model, each optimizer step needs 16 long-form rollouts per prompt — each of which can be tens of thousands of tokens. The wallclock cost is high enough that production stacks treat rollouts as a separate pipeline from the gradient computation, often running them on a separate fleet of inference servers and streaming the completed trajectories back to the trainer.
+
+The good news is that rollouts are *embarrassingly parallel* — there is no synchronization needed across siblings of a group. PPO with a critic, in contrast, must serialize critic forward passes with actor rollouts, or maintain a more complex producer/consumer architecture to avoid bubbles.
+
+## Part 4 — Practical recipes and pitfalls
+
+A few things you actually need to get right when running either algorithm.
+
+### Group size $G$
+
+The group baseline has Monte-Carlo variance $\sigma_r^2 / G$. The Dr. GRPO advantage is $r_i - \mu_q$, so the variance of $\widehat{A}_i$ at a single $i$ is approximately $\sigma_r^2(1 - 1/G)$ — slightly *less* than the raw reward variance, because part of the noise gets absorbed into the baseline. Larger $G$ shrinks baseline noise.
+
+The other reason to want large $G$ is that the *signed average* of $\widehat{A}_i$ across a group is zero by construction. If $G = 2$ and one sample is correct, $\widehat{A}_\text{correct} = +0.5$ and $\widehat{A}_\text{wrong} = -0.5$. With $G = 16$ and $\hat{p}_q = 1/4$, you get $\widehat{A}_\text{correct} = +0.75$ and $\widehat{A}_\text{wrong} = -0.25$, and the gradient signal is more informative.
+
+Typical settings: $G = 16$ for math-style outcome rewards, $G = 8$ when the rollouts are very long (think coding agents) and the compute is the bottleneck, $G = 64$ when you're trying to squeeze the last bit of signal out of a small dataset.
+
+### Temperature for rollouts
+
+Group baselines are useless if all $G$ samples are identical. Sampling temperature $T \approx 1.0$ is standard; the policy entropy must be high enough that the $G$ rollouts spread out over the reward distribution. R1-Zero uses $T = 1.0$, and DeepSeek-R1 makes a point of not annealing temperature down during RL training, because doing so collapses the group diversity and kills the baseline.
+
+A common failure mode in practice is temperature decay: someone introduces a schedule that pulls $T$ from 1.0 down toward 0.7 over training, and the group reward variance collapses, and the loss term goes to numerical garbage as $\sigma_q \to 0$ (in GRPO) or the gradient goes to zero (in Dr. GRPO). Watch the per-prompt $\sigma_q$ — if it ever runs near zero for a non-trivial fraction of prompts, your effective $G$ has collapsed.
+
+### Reward design
+
+The R1-Zero rule-based reward is:
+
+$$
+r(q, o) \;=\; r_\text{format}(o) \;+\; r_\text{correct}(o, y^*),
+$$
+
+with $r_\text{format} \in \{0, \text{small bonus}\}$ for emitting the required tags and $r_\text{correct} \in \{0, 1\}$ for matching the gold answer. The format reward is *not* what's doing the work — it's the correctness reward that produces the learning. The format reward is there to keep the rollouts well-formed enough to parse.
+
+The single biggest practical mistake in reward design is *partial-credit* rewards. Giving a 0.5 reward for "the first half of the algebra is right but the final answer is wrong" inserts a process-supervision signal that GRPO and Dr. GRPO were not designed for and that interacts badly with the group baseline (the group mean is now over a continuous distribution and the advantages stop being interpretable). If you want process supervision, use the PRM extension; if you don't want process supervision, keep the reward binary.
+
+### Reference policy and $\beta$
+
+The reference policy $\pi_\text{ref}$ is the policy you want to stay near. For R1-Zero it is the base model (no SFT); for R1 it is the SFT checkpoint. Either way, $\pi_\text{ref}$ is fixed for the duration of training — *do not* re-anchor it to the current $\pi_\theta$ partway through, even though the temptation is real, because re-anchoring lets the policy drift unboundedly while never feeling a regularizer.
+
+The $\beta$ weight in front of the KL term should be small enough that the regularizer does not dominate the task reward signal. Typical values are $10^{-3}$ to $10^{-2}$. Too small and the policy will drift off into reward-hacked nonsense; too large and the policy will not move at all. A useful diagnostic is to track the per-token KL divergence over training — it should grow from $0$ to a few nats over the first few thousand steps, then stabilize.
+
+### Importance-ratio clipping vs. the off-policyness of GRPO
+
+Both algorithms inherit the PPO clip on the per-token ratio $\rho_{i,t}$. In single-step RL (one gradient step per rollout batch), $\rho_{i,t} \approx 1$ and the clip is rarely active. In multi-step RL (several gradient steps per rollout batch, which is the regime PPO was designed for), $\rho$ can drift away from $1$ and the clip starts mattering.
+
+GRPO and Dr. GRPO are often run with a small number of inner gradient steps per rollout batch — sometimes just one. In that limit they are closer to vanilla REINFORCE-with-baseline than to PPO. The clip is then a safety net against numerical excursions rather than a primary regularizer.
+
+### Numerical issues
+
+A small list of things to watch:
+
+- **Padding tokens.** Mask before summing log-probs; do not divide by $L_\text{max}$, divide by the *true* sample length (in GRPO) or the constant $L_\text{norm}$ (in Dr. GRPO).
+- **Empty groups.** If all $G$ samples for a prompt happen to be identical (e.g., all wrong, all the same wrong answer), the GRPO advantage is $0/\epsilon \approx 0$ and the gradient for that prompt vanishes. Dr. GRPO's advantage is also $0$ in this case (the centered reward is zero). This is *correct* behavior — you can't learn from a no-variance group — but it means you should track the fraction of prompts in each batch with zero gradient and consider sampling more rollouts or harder prompts when this fraction grows large.
+- **Reward of 0/1 with all-correct or all-wrong groups.** Same as above: the centered reward is zero, no gradient, no problem — but a large fraction of all-correct groups is a sign the curriculum has saturated.
+
+## Part 5 — Algorithmic pseudocode
+
+For reference, the inner loop of a Dr. GRPO trainer:
+
+```python
+def drgrpo_step(model, ref_model, prompts, G=16, beta=0.001, eps=0.2, L_norm=2048):
+    # 1. Sample G rollouts per prompt from the (frozen) old policy.
+    completions, logp_old = sample_rollouts(model, prompts, num_samples=G, T=1.0)
+    # completions:  (B, G, L)   tokens
+    # logp_old:     (B, G, L)   per-token log-probs under pi_old
+
+    # 2. Score rewards with a rule-based grader.
+    rewards = grade(prompts, completions)           # (B, G)
+
+    # 3. Group-relative advantage, NO std normalization.
+    mu = rewards.mean(dim=1, keepdim=True)          # (B, 1)
+    adv = rewards - mu                              # (B, G)
+    adv = adv.unsqueeze(-1).expand_as(completions)  # (B, G, L)
+
+    # 4. Reference and current log-probs on the same completions.
+    with torch.no_grad():
+        logp_ref = ref_model.logp(prompts, completions)   # (B, G, L)
+    logp_new = model.logp(prompts, completions)           # (B, G, L)
+
+    # 5. Per-token importance ratio.
+    log_ratio = logp_new - logp_old
+    ratio = log_ratio.exp()
+
+    # 6. PPO-style clipped surrogate.
+    surrogate1 = ratio * adv
+    surrogate2 = ratio.clamp(1 - eps, 1 + eps) * adv
+    pg = torch.minimum(surrogate1, surrogate2)            # (B, G, L)
+
+    # 7. KL k3 estimator against the reference.
+    log_ref_ratio = logp_ref - logp_new
+    kl = log_ref_ratio.exp() - log_ref_ratio - 1.0        # (B, G, L)
+
+    # 8. Loss: constant length normalizer, group average, batch average.
+    mask = completion_mask(completions)                    # (B, G, L), 1 for real tokens
+    loss = -(pg - beta * kl) * mask
+    loss = loss.sum(dim=-1)                                # sum over tokens, (B, G)
+    loss = loss / L_norm                                   # constant normalizer
+    loss = loss.mean()                                     # average over G and over B
+
+    loss.backward()
+    optimizer.step()
+    return loss.item(), rewards.mean().item()
+```
+
+The GRPO version differs in exactly two places:
+
+```python
+# 3'. Group-relative advantage WITH std normalization.
+mu = rewards.mean(dim=1, keepdim=True)
+sigma = rewards.std(dim=1, keepdim=True) + 1e-8
+adv = (rewards - mu) / sigma                          # (B, G)
+# ...
+# 8'. Per-sample length normalization.
+loss = -(pg - beta * kl) * mask
+loss = loss.sum(dim=-1)                               # sum over tokens, (B, G)
+seq_len = mask.sum(dim=-1).clamp_min(1)               # (B, G)
+loss = loss / seq_len                                  # per-sample length norm
+loss = loss.mean()                                     # average over G and over B
+```
+
+Two lines of code distinguish the two algorithms. The behavioral differences flow entirely from those two lines.
+
+## Part 6 — Frequently asked design questions
+
+A handful of things people commonly ask when they sit down with these algorithms for the first time.
+
+### Why not just use REINFORCE with a constant baseline?
+
+You can, and people have. The group baseline buys you per-prompt variance reduction that a global constant baseline cannot match: a prompt where the policy has a 90% pass rate has a baseline of 0.9, and a prompt with a 10% pass rate has a baseline of 0.1, so the *sign* of the advantage tracks "did this sample beat or lose to its peers on the same question." A global constant of 0.5 would give the same sign to every correct sample regardless of question difficulty, which is a strictly noisier signal.
+
+### Why not use a state-conditioned baseline (i.e., a critic)?
+
+If you can train a good critic, you should. The reasons people don't, in this regime, are listed above: memory, engineering, value-function bias, and the difficulty of training a critic for long-form chain-of-thought outputs where the reward is terminal and the trajectory is autoregressive. The group baseline gets you 90% of the variance reduction for almost no infrastructure.
+
+The interesting middle ground is *learned-baseline-as-correction*: train a small critic to predict the residual $r_i - \mu_q$ given the prompt and the prefix, and use it to assign per-token credit on top of the constant trajectory-level baseline. This is essentially the direction DAPO and several follow-up papers explore. It is not what GRPO or Dr. GRPO do.
+
+### Why not use forward-KL instead of reverse-KL?
+
+GRPO uses forward KL ($\mathrm{KL}[\pi_\theta \| \pi_\text{ref}]$), which is *mode-seeking*: it tolerates the current policy assigning low probability to outputs that $\pi_\text{ref}$ also assigns low probability to, but penalizes the policy for putting mass where $\pi_\text{ref}$ does not. The reverse direction ($\mathrm{KL}[\pi_\text{ref} \| \pi_\theta]$) is *mass-covering*: it forces $\pi_\theta$ to keep mass on everything $\pi_\text{ref}$ has mass on, which would be over-restrictive for a policy whose job is to *focus* on correct outputs.
+
+The forward direction is the right one for "stay near the reference but specialize on the task." Reversing it would push the policy back toward producing the full distribution of base-model outputs, including the ones that are wrong for the task. Don't reverse it.
+
+### What's the relationship to RLHF / DPO?
+
+RLHF (PPO on a learned reward model derived from human preferences) is essentially PPO with a different reward source. You can drop GRPO or Dr. GRPO in as the optimizer in an RLHF pipeline — sample $G$ completions, score them with the reward model, compute the group-relative advantage. The bias analysis goes through unchanged.
+
+DPO is a different beast: it sidesteps the reward model entirely by deriving a closed-form supervised loss from a preference pair under a Bradley-Terry assumption. There is no advantage estimation in DPO; there is no rollout in DPO. DPO and GRPO are not direct competitors — they live in different parts of the post-training landscape.
+
+### Can I combine Dr. GRPO with a process reward model?
+
+Yes. The Dr. GRPO bias fixes are orthogonal to the choice of reward signal. If you have per-step rewards from a PRM, compute the per-token advantage as in the GRPO process-supervision section but *without* the std normalization. The length normalization is also unchanged: use a constant $L_\text{norm}$ rather than per-sample $|o_i|$.
+
+### Will Dr. GRPO make my training run faster?
+
+Not directly. The per-step compute is identical to GRPO. What Dr. GRPO buys you is *better gradient quality per step*, which translates to faster *convergence in step count* and, separately, into shorter rollouts (because the length bias is gone), which makes each step cheaper. The combined effect is a meaningful wallclock improvement, but not a structural one.
+
+## Part 7 — Reading list and where to go next
+
+The two papers that anchor this post are essential reading if you want to ship one of these algorithms:
+
+- Shao et al., "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," [arXiv:2402.03300](https://arxiv.org/abs/2402.03300). GRPO is introduced in §4.
+- Liu et al., "Understanding R1-Zero-like Training: A Critical Perspective," [arXiv:2503.20783](https://arxiv.org/abs/2503.20783). The Dr. GRPO derivation is in §3, the empirical study in §4.
+
+Surrounding context, in the order I would read them:
+
+- DeepSeek-R1, "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning," [arXiv:2501.12948](https://arxiv.org/abs/2501.12948). The applied recipe that made GRPO famous.
+- Schulman et al., "Proximal Policy Optimization Algorithms," [arXiv:1707.06347](https://arxiv.org/abs/1707.06347). The base algorithm everything is grafted on.
+- Schulman, "Approximating KL divergence," blog post 2020. The k3 estimator and why it's the right choice for the KL term in policy gradient.
+
+A few follow-up algorithms in the same family worth knowing about:
+
+- DAPO (Decoupled Advantage Policy Optimization). Adds a per-step critic on top of the group baseline; explores asymmetric clip ranges for positive vs. negative advantages.
+- RLOO (REINFORCE Leave-One-Out). The leave-one-out baseline is mathematically equivalent to the group-mean baseline up to a factor of $G/(G-1)$. RLOO predates GRPO by years and is essentially the same idea minus the PPO machinery.
+- GSPO / VAPO and a small zoo of 2025 variants that explore different combinations of token-level vs. sequence-level loss, with and without the std normalization, with and without per-sample length normalization. The bias analysis from Dr. GRPO is the lens through which to read all of them.
+
+## Closing remarks
+
+GRPO is the algorithm that made critic-free LLM RL practical at scale. It traded a learned value function for $G$ extra rollouts per prompt and rewrote the optimizer around a within-group baseline. Dr. GRPO is the algorithm that took GRPO seriously enough to write out its gradient term by term, located the two places where the normalization choices introduced bias, and proposed the minimal fix.
+
+The lesson, if you want a portable one: every normalization in a policy-gradient loss is a *choice*, and every choice has a corresponding bias direction. The default "z-score the advantage" and "divide by sequence length" both look like neutral variance-reduction moves and are actually content-bearing. If you write down your loss carefully and take the gradient by hand, you will see them; if you don't, you won't.
+
+For an R1-Zero-style production run today, I would start from Dr. GRPO unless I had a specific reason to keep the GRPO normalizations — and the only reasons I can think of are "I am exactly reproducing an R1-Zero baseline" or "my reward signal is continuous and the std-normalization is doing real scale-fixing work." For everything else, the unbiased version is the default.

@@ -1,0 +1,422 @@
+---
+author: Opus 4.7
+pubDatetime: 2026-05-28T12:00:00.000Z
+title: "From GRPO to GSPO: Group-Based Policy Optimization for LLMs"
+slug: grpo-and-gspo-deep-dive
+featured: true
+draft: false
+tags:
+  - reinforcement-learning
+  - rlhf
+  - deep-learning
+  - llm
+  - grpo
+  - gspo
+  - deepseek
+  - qwen
+  - paper-review
+description: "A complete walkthrough of Group Relative Policy Optimization (GRPO) and Group Sequence Policy Optimization (GSPO) — the policy-gradient algorithms behind DeepSeek-R1 and Qwen3. Full math, the failure mode that motivated GSPO, the MoE story, and a side-by-side comparison."
+---
+
+Reasoning-model RL post-training has, in two years, converged on a tiny family of policy-gradient algorithms. PPO sat at the top in the InstructGPT / ChatGPT era. **GRPO (Group Relative Policy Optimization)**, introduced in DeepSeekMath ([arXiv:2402.03300](https://arxiv.org/abs/2402.03300)) and famously used to train DeepSeek-R1 ([arXiv:2501.12948](https://arxiv.org/abs/2501.12948)), replaced PPO as the de-facto default — it dropped the value network, simplified the loss, and made long-form reasoning RL practical. Then in 2025 the Qwen team published **GSPO (Group Sequence Policy Optimization)** ([arXiv:2507.18071](https://arxiv.org/abs/2507.18071)) used to train the Qwen3 series, arguing that GRPO's token-level importance ratio is *fundamentally* wrong for sequence-level reward and is the reason large MoE runs keep blowing up.
+
+This post is a complete mathematical walkthrough of both algorithms, the failure mode that motivated the move from GRPO to GSPO, and what changes (and what doesn't) when you swap one for the other.
+
+## Table of contents
+
+## Preliminaries: importance sampling and PPO
+
+To make the GRPO / GSPO story self-contained, it helps to ground both in the policy gradient + importance sampling lineage they descend from.
+
+### Policy gradient with off-policy data
+
+We want to maximize the expected reward of a stochastic policy $\pi_\theta$:
+
+$$
+J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta}[R(\tau)].
+$$
+
+The score-function gradient is $\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\bigl[R(\tau)\, \nabla_\theta \log \pi_\theta(\tau)\bigr]$. In LLM RL the *trajectory* $\tau$ is the response $o = (o_1, \dots, o_T)$ generated for a prompt $q$, and the per-step decomposition reads
+
+$$
+\nabla_\theta J(\theta) \;=\; \mathbb{E}_{q,\,o \sim \pi_\theta}\!\left[\, \sum_{t=1}^{|o|} \nabla_\theta \log \pi_\theta(o_t \mid q, o_{<t}) \cdot A_t \,\right],
+$$
+
+where $A_t$ is some advantage estimate at token $t$.
+
+Running this strictly *on-policy* — generate a batch, take one gradient step, throw it away, regenerate — is wasteful: LLM rollouts are the most expensive part of the pipeline. So we collect data with a behaviour policy $\pi_{\theta_{old}}$ (usually a frozen snapshot of $\pi_\theta$ from a few steps ago) and reuse it for several gradient updates. The bias correction is **importance sampling**:
+
+$$
+\mathbb{E}_{x \sim \pi_\theta}[f(x)] \;=\; \mathbb{E}_{x \sim \pi_{\theta_{old}}}\!\left[\, \frac{\pi_\theta(x)}{\pi_{\theta_{old}}(x)} f(x) \,\right].
+$$
+
+The IS ratio $\pi_\theta / \pi_{\theta_{old}}$ is unbiased *in expectation* but high-variance whenever the two distributions disagree. The whole design space of PPO-style methods is about taming that variance without destroying the unbiasedness too badly.
+
+### PPO's clipped surrogate
+
+PPO ([Schulman et al., 2017](https://arxiv.org/abs/1707.06347)) defines a *per-token* IS ratio
+
+$$
+r_t(\theta) \;=\; \frac{\pi_\theta(o_t \mid q, o_{<t})}{\pi_{\theta_{old}}(o_t \mid q, o_{<t})}
+$$
+
+and optimizes the clipped surrogate
+
+$$
+\mathcal{J}_{\text{PPO}}(\theta) \;=\; \mathbb{E}_{q,\,o \sim \pi_{\theta_{old}}}\!\left[\, \frac{1}{|o|}\sum_{t=1}^{|o|} \min\!\Bigl( r_t(\theta)\, \hat{A}_t,\; \mathrm{clip}\!\bigl(r_t(\theta),\, 1-\varepsilon,\, 1+\varepsilon\bigr)\, \hat{A}_t \Bigr) \,\right].
+$$
+
+The clip caps the optimization signal from any token whose ratio drifts too far from 1, which is PPO's variance-control mechanism. $\hat{A}_t$ is typically Generalized Advantage Estimation (GAE) computed with a learned value function $V_\phi(s_t)$:
+
+$$
+\hat{A}_t^{\text{GAE}(\lambda)} \;=\; \sum_{l=0}^{T-t-1} (\gamma\lambda)^l\, \delta_{t+l}, \qquad \delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t).
+$$
+
+In LLM RL, the reward $r_t$ is almost always sparse — zero on every token except the last, where the reward model (or a verifier) produces a scalar. So $\hat{A}_t$ is basically the discounted bootstrapped value, and the value network is doing the heavy lifting.
+
+That value network is exactly what GRPO removes.
+
+## Part 1 — Group Relative Policy Optimization (GRPO)
+
+GRPO was introduced as a tweak to PPO to make math RL tractable: instead of training a value function whose target is a tiny reward signal at the end of long reasoning traces, *generate a group of completions for the same prompt and use their reward statistics to define a baseline*. The value function disappears; only the policy and a frozen reference model remain.
+
+### The objective
+
+For each prompt $q$, sample a *group* of $G$ responses $\{o_i\}_{i=1}^G$ from the old policy $\pi_{\theta_{old}}$. Score each with a reward function $r_i = R(q, o_i)$ — in DeepSeekMath, $R$ is a learned reward model; in DeepSeek-R1, $R$ is a rule-based verifier that returns 1 if the boxed answer matches the ground truth and 0 otherwise.
+
+Define the per-token IS ratio exactly as PPO:
+
+$$
+r_{i,t}(\theta) \;=\; \frac{\pi_\theta(o_{i,t} \mid q,\, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t} \mid q,\, o_{i,<t})}.
+$$
+
+Compute a group-normalized advantage shared by every token in response $i$:
+
+$$
+\hat{A}_{i,t} \;=\; \hat{A}_i \;=\; \frac{r_i - \mathrm{mean}(\{r_1, \dots, r_G\})}{\mathrm{std}(\{r_1, \dots, r_G\})}.
+$$
+
+Then maximize
+
+$$
+\boxed{\;
+\mathcal{J}_{\text{GRPO}}(\theta) \;=\; \mathbb{E}_{q,\,\{o_i\}\sim\pi_{\theta_{old}}}\!\left[\, \frac{1}{G}\sum_{i=1}^G \frac{1}{|o_i|}\sum_{t=1}^{|o_i|} \Bigl\{ \min\!\bigl(r_{i,t}(\theta)\,\hat{A}_{i,t},\; \mathrm{clip}(r_{i,t}(\theta), 1-\varepsilon, 1+\varepsilon)\,\hat{A}_{i,t}\bigr) \;-\; \beta\, \mathbb{D}_{\mathrm{KL}}\!\bigl[\pi_\theta \,\|\, \pi_{\text{ref}}\bigr]_{i,t} \Bigr\} \,\right].
+\;}
+$$
+
+Read off the design choices:
+
+- **No value network.** The baseline is the *group mean reward*. The advantage is the same for every token in a response — no per-token credit assignment.
+- **Per-token IS ratio.** Same as PPO. Each token has its own clip.
+- **KL is an explicit loss term**, not added to the reward. The reference $\pi_{\text{ref}}$ is usually the SFT model from before RL began. $\beta$ is a small constant (typical values $0.001$ to $0.04$).
+- **Group-then-token averaging.** The outer sum is normalized by group size $G$; the inner sum is normalized by response length $|o_i|$. So short and long responses contribute equally per response, and every token within a response contributes equally per token.
+
+### The KL term — k3 unbiased estimator
+
+The KL above is estimated *unbiasedly and non-negatively* using the **k3 estimator** introduced by [John Schulman](http://joschu.net/blog/kl-approx.html):
+
+$$
+\mathbb{D}_{\mathrm{KL}}\!\bigl[\pi_\theta \,\|\, \pi_{\text{ref}}\bigr]_{i,t} \;\approx\; \frac{\pi_{\text{ref}}(o_{i,t} \mid q,\, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q,\, o_{i,<t})} \;-\; \log \frac{\pi_{\text{ref}}(o_{i,t} \mid q,\, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q,\, o_{i,<t})} \;-\; 1.
+$$
+
+Why this and not the naive plug-in $\log(\pi_\theta / \pi_{\text{ref}})$?
+
+- The naive estimator $\log(\pi_\theta(x)/\pi_{\text{ref}}(x))$ for $x \sim \pi_\theta$ is unbiased for KL but **can be negative**, which makes the loss interpretation noisy.
+- The k3 form $f(x) - \log f(x) - 1$ where $f = \pi_{\text{ref}}/\pi_\theta$ uses $\log f(x) - (f(x) - 1)$, which is non-positive everywhere (since $\log u \le u - 1$), so its negation is non-negative.
+- It has lower variance because the sign is fixed.
+
+The gradient of this estimator flows only through $\pi_\theta$ (the reference is frozen). At initialization $\pi_\theta = \pi_{\text{ref}}$ so the KL term is zero; it grows as the policy drifts.
+
+### Where the advantage comes from — outcome vs process
+
+DeepSeekMath actually presents *two* GRPO variants:
+
+1. **Outcome supervision (GRPO-O).** A single scalar reward per response, normalized within the group. Every token in $o_i$ gets the same $\hat{A}_i$. This is the form used in DeepSeek-R1.
+2. **Process supervision (GRPO-P).** A process reward model emits a reward $r_i^{(k)}$ at the end of each reasoning *step* $k$ (an "end-of-step" token). Normalize these step rewards across the group, then accumulate to each token:
+
+$$
+\hat{A}_{i,t} \;=\; \sum_{\text{step } k \text{ ends at position} \ge t} \tilde{r}_i^{(k)}, \qquad \tilde{r}_i^{(k)} = \frac{r_i^{(k)} - \mathrm{mean}(\text{group step rewards})}{\mathrm{std}(\text{group step rewards})}.
+$$
+
+3. **Iterative GRPO.** Periodically re-train the reward model on samples from the current policy and reset $\pi_{\text{ref}}$ to the latest snapshot. Useful when the reward model's distribution shifts a lot during RL.
+
+In practice the most-used form by far is the outcome-supervised one, because the rule-based verifier in math/code RL gives a clean 0/1 signal that needs no process model.
+
+### Why drop the value network?
+
+Three reasons, in roughly decreasing order of importance:
+
+1. **The value target is unstable.** For long reasoning traces (think 8k–32k tokens), the only non-zero reward is at the very end. A learned $V_\phi(s_t)$ must regress this single scalar back through thousands of tokens, with credit assignment that is essentially a hope. The bias of GAE explodes with $T$.
+2. **It's a second model the size of the policy.** That doubles activation memory during training, and for the giant frontier models it is a serious constraint. (Yes you can shrink the value head, but in PPO-for-LLMs the value model is usually as big as or close to the size of the policy backbone.)
+3. **You can get a low-variance baseline almost for free** by sampling $G$ responses per prompt and using the group mean. The variance of $r_i - \bar{r}$ is $\mathrm{Var}(r)(1 - 1/G)$, so $G=8$ or $G=16$ already removes most of the constant baseline variance, and crucially the baseline is *unbiased* with respect to the policy.
+
+The tradeoff you accept is **no per-token credit assignment**. Every token in a winning trajectory gets the same positive advantage; every token in a losing trajectory gets the same negative advantage. Including the tokens that had nothing to do with why the trajectory was good or bad. GRPO's bet is that the *clipped* importance ratio per token, applied to a uniform advantage, still concentrates updates on tokens that actually moved between $\pi_{\theta_{old}}$ and $\pi_\theta$ — implicitly assigning credit through the ratio's magnitude.
+
+### One subtle point: where the average lives
+
+Different open-source GRPO implementations (TRL, OpenRLHF, veRL, DeepSpeed-Chat) disagree on the *exact* normalization. The DeepSeekMath paper writes the objective as **per-token averaged within a response, then averaged across the group**:
+
+$$
+\frac{1}{G}\sum_i \frac{1}{|o_i|} \sum_t (\cdots).
+$$
+
+Some implementations average across *all tokens in the batch* instead:
+
+$$
+\frac{1}{\sum_i |o_i|} \sum_i \sum_t (\cdots).
+$$
+
+The two are equivalent up to a per-response weight that depends on $|o_i|$. The first form gives long and short responses equal weight at the *response* level; the second gives every *token* equal weight, which downweights short responses. This sounds like a footnote — it is not. With long-response RL, where some completions run to 16k+ tokens and others terminate in 200, the choice shifts which kinds of behaviour get reinforced. (DAPO, an early GRPO variant from ByteDance, advocates for the token-level form for exactly this reason.)
+
+### Practical knobs
+
+The hyperparameters that actually matter in practice:
+
+- **Group size $G$.** Larger groups give better baselines but cost more rollouts per prompt. $G \in \{4, 8, 16\}$ is the typical range. DeepSeek-R1 used $G=64$ for the final RL run on long-context reasoning.
+- **Clip range $\varepsilon$.** Same as PPO. $\varepsilon = 0.2$ is the inherited default, but some open recipes use asymmetric clips ($\varepsilon_{\text{low}} = 0.2$, $\varepsilon_{\text{high}} = 0.28$) to permit slightly more exploration on the upside.
+- **KL coefficient $\beta$.** Small. $0.001$ to $0.04$. DeepSeek-R1 sets $\beta$ to zero for the final RL run (no KL anchor), letting the policy drift freely — viable because rule-based rewards are not gameable in the way an RM is.
+- **Old-policy refresh cadence.** How many gradient steps to take per rollout batch before re-sampling. Higher → more reuse of expensive rollouts but larger IS ratio drift. Typical is $\mu = 1$ to $4$.
+
+### What a GRPO step looks like end-to-end
+
+For one outer iteration:
+
+1. **Sample.** Pick a batch of prompts $\{q_b\}$. For each prompt, sample $G$ responses $\{o_{b,i}\}_{i=1}^G$ from $\pi_{\theta_{old}}$.
+2. **Score.** Compute $r_{b,i} = R(q_b, o_{b,i})$ for every response. Compute group-normalized advantages $\hat{A}_{b,i}$.
+3. **Forward.** Run $\pi_\theta$ and $\pi_{\text{ref}}$ on every $(q_b, o_{b,i})$ to get per-token log-probs.
+4. **Loss.** Compute the clipped surrogate per token, add the k3 KL penalty per token, average per the chosen normalization scheme.
+5. **Backward, step.** Update $\theta$. Repeat steps 3–5 for $\mu$ epochs over the same sampled batch.
+6. **Refresh.** Set $\pi_{\theta_{old}} \leftarrow \pi_\theta$, go to step 1.
+
+That is GRPO in full. Now the failure mode that prompted GSPO.
+
+## Part 2 — Why GRPO breaks (especially on MoE)
+
+The Qwen GSPO paper opens with a strong claim: GRPO's per-token IS ratio is **ill-posed** for sequence-level rewards, and the resulting variance is so severe that large MoE RL runs become unstable without aggressive interventions like Routing Replay. The argument is worth reconstructing carefully because it generalizes beyond MoE.
+
+### The unit-of-importance mismatch
+
+The reward is computed once, at the sequence level — $R(q, o)$ is a function of the *whole* response. The natural quantity to importance-sample is therefore the sequence likelihood ratio:
+
+$$
+\frac{\pi_\theta(o \mid q)}{\pi_{\theta_{old}}(o \mid q)} \;=\; \prod_{t=1}^{|o|} \frac{\pi_\theta(o_t \mid q, o_{<t})}{\pi_{\theta_{old}}(o_t \mid q, o_{<t})}.
+$$
+
+A single sample of this ratio is unbiased for $\mathbb{E}_{\pi_\theta}[R]$ in the usual IS sense. GRPO does something different. It pulls the product apart and treats each token's ratio as if it were correcting the sampling distribution of that token *alone*:
+
+$$
+\frac{1}{|o|}\sum_{t=1}^{|o|} r_t(\theta)\, \hat{A}.
+$$
+
+This is **not** an IS-correction for the sequence-level reward. From the perspective of any individual token, a single sample of $r_t(\theta)$ is a single-sample IS estimate of the marginal $\pi_\theta(o_t | q, o_{<t})/\pi_{\theta_{old}}(o_t | q, o_{<t})$. The Qwen paper's framing: per-token IS with one sample per token is **noise** rather than correction. It does not reduce the bias of any meaningful estimator; it injects variance.
+
+That variance is fine if the per-token ratios stay near 1 — clipping then keeps the per-token contribution bounded and the average is roughly the on-policy gradient. The trouble is that as response length grows and as the model gets larger, more and more tokens drift far enough from 1 to be clipped, and the *clipped* part of the loss has zero gradient. So the effective batch size of the policy gradient shrinks as training progresses.
+
+### The MoE-specific catastrophe: expert routing drift
+
+This is where the failure becomes loud. In an MoE model, each token activates a subset of experts chosen by the router. After a single gradient step, the *router* changes, so the same $(q, o_{<t}, o_t)$ may activate a different set of experts under $\pi_\theta$ than it did under $\pi_{\theta_{old}}$. Even if the underlying expert weights are nearly identical, **the conditional probability $\pi(o_t \mid q, o_{<t})$ can change discontinuously** because it now depends on a different set of expert outputs.
+
+Empirically the Qwen team reports: after a single optimization step on a 48-layer MoE with 8/128 experts active, roughly 10% of tokens see their activated experts change. That means the per-token IS ratio for those tokens is essentially random — it reflects an expert-routing flip, not a meaningful policy change.
+
+If you keep GRPO's per-token formulation, the loss becomes a sum of $|o|$ such random ratios, and on a long response some fraction of them produce clipping or extreme gradients. Training diverges.
+
+The Qwen-1 era workaround was **Routing Replay**: cache the router decisions made by $\pi_{\theta_{old}}$ at rollout time, and *force* the same expert routes during the training forward pass under $\pi_\theta$. This keeps the per-token IS ratio meaningful because the same expert weights are being compared. But:
+
+- It costs memory (you store the entire routing trace per token).
+- It costs flexibility (the router cannot improve via the RL loss in the same way the rest of the model does).
+- It blocks improvements to MoE capacity (e.g. you cannot increase the number of activated experts).
+- It is a workaround. It does not address the underlying mismatch.
+
+GSPO's framing: don't paper over the routing flip with replay. *Fix the unit of importance sampling* so that single-token routing changes wash out.
+
+### A second symptom: the long-response sink
+
+There is a more general version of the problem that does not require MoE. As response length grows:
+
+- The product of token ratios $\prod_t r_t(\theta)$ has variance that grows roughly exponentially in $|o|$ when ratios drift even slightly from 1.
+- Even the arithmetic mean $\frac{1}{|o|}\sum_t r_t(\theta) \hat{A}$ that GRPO actually uses gets dominated by a few outlier tokens whose ratios are extreme.
+- Clipping bounds the surrogate's value but not the gradient's variance, because the clip only fires on individual tokens — many tokens just below the clip threshold still contribute oversized updates.
+
+The result: long-response training is fragile under GRPO. You either lower the learning rate, shrink the group, shorten the responses, or eat instabilities. None of those scale.
+
+## Part 3 — Group Sequence Policy Optimization (GSPO)
+
+GSPO's central change is one line:
+
+> **Apply importance sampling at the sequence level, then clip and optimize at the sequence level.**
+
+Everything else — group-relative advantages, no value model, KL anchor against the reference — stays the same. The implementations are nearly identical at the data-pipeline level. Only the loss differs.
+
+### The sequence-level importance ratio
+
+Define
+
+$$
+s_i(\theta) \;=\; \left( \frac{\pi_\theta(o_i \mid q)}{\pi_{\theta_{old}}(o_i \mid q)} \right)^{1/|o_i|} \;=\; \exp\!\left( \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \log \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t} \mid q, o_{i,<t})} \right).
+$$
+
+Two things to notice:
+
+1. **It is the sequence likelihood ratio raised to $1/|o_i|$** — equivalently, the exponential of the *mean* log-ratio over tokens. This length-normalization is what keeps $s_i$ at the same scale across responses of wildly different length. Without the $1/|o_i|$ exponent, $s_i$ would have variance growing with $|o_i|$ (the unit-of-measure stops being comparable across responses), and the single sequence-level clip range $\varepsilon$ would not make sense.
+2. **It is computed from the same per-token log-probs as GRPO** — no extra forward pass. The difference is entirely in how those log-probs are aggregated.
+
+### The GSPO objective
+
+With the sequence-level ratio in hand, the loss is the PPO clip applied once per sequence:
+
+$$
+\boxed{\;
+\mathcal{J}_{\text{GSPO}}(\theta) \;=\; \mathbb{E}_{q,\,\{o_i\}\sim\pi_{\theta_{old}}}\!\left[\, \frac{1}{G}\sum_{i=1}^G \min\!\Bigl( s_i(\theta)\, \hat{A}_i,\; \mathrm{clip}\!\bigl(s_i(\theta), 1-\varepsilon, 1+\varepsilon\bigr)\, \hat{A}_i \Bigr) \,\right].
+\;}
+$$
+
+That is it. The advantage $\hat{A}_i$ is the same group-normalized scalar GRPO uses; the per-token loop is gone, the per-token clip is gone. Each entire response either contributes its full surrogate term or is clipped *as a sequence*.
+
+A small but important consequence: **the clip range $\varepsilon$ needs to be much smaller than GRPO's**. A typical GRPO $\varepsilon$ is $0.2$, meaning a per-token ratio in $[0.8, 1.2]$. For the *geometric-mean* sequence ratio over hundreds of tokens, $0.2$ is enormous — you essentially never clip. The Qwen paper uses $\varepsilon$ around $\sim$3e-4 for the lower bound and $\sim$4e-4 for the upper, asymmetric. (These look strange the first time you see them; the right intuition is that they are bounding the *average per-token log-ratio*, which is what $\log s_i$ is, so a few thousandths is a lot.)
+
+### Why this fixes the MoE problem
+
+Under GSPO, the IS unit is the *sequence*, so a single token's routing flip changes $\log s_i$ by $\frac{1}{|o_i|}$ of the flip's log-ratio. Average a few thousand tokens together and individual flips average out. The mean log-ratio over the whole sequence stays close to 0 even if a fraction of tokens have switched expert routes, as long as the *aggregate* sequence likelihood under $\pi_\theta$ and $\pi_{\theta_{old}}$ is close.
+
+Concretely: if 10% of tokens have meaningfully different expert routes and each contributes a log-ratio of order $\pm 1$, the per-sequence mean log-ratio is on the order of $0.1$ in magnitude — well controllable by a $\sim$3e-4 clip range *after* most of the noise has averaged out within the sequence. Compare this to GRPO, where each of those flipped tokens individually clears the $\pm 0.2$ per-token clip and zero-gradients itself out of the loss.
+
+The Qwen team's reported outcome on Qwen3-30B-A3B MoE: GSPO trains stably *without* Routing Replay, while GRPO requires Routing Replay to not diverge and still trains less efficiently. They were also able to remove Routing Replay from production, simplifying both the training stack and the RL infrastructure.
+
+### GSPO-token: a per-token gradient under sequence-level clipping
+
+There is an interesting subtlety the paper raises. GSPO's loss is sequence-level, which means every token in a sequence shares the same scalar weight ($\hat{A}_i$ multiplied by the same clipped $s_i$). For settings like multi-turn RL where you might *want* to mask certain tokens (assistant-only loss, tool-output tokens excluded, etc.), the sequence form doesn't directly let you re-weight individual tokens.
+
+GSPO-token addresses this with a careful rewrite. Define a per-token quantity
+
+$$
+s_{i,t}(\theta) \;=\; \mathrm{sg}\!\bigl[\, s_i(\theta) \,\bigr] \cdot \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\mathrm{sg}\!\bigl[\, \pi_\theta(o_{i,t} \mid q, o_{i,<t}) \,\bigr]},
+$$
+
+where $\mathrm{sg}[\cdot]$ is the stop-gradient operator. In the forward pass this is exactly $s_i(\theta)$ for every token $t$ in response $i$. In the backward pass, the gradient of $s_{i,t}$ with respect to $\theta$ is
+
+$$
+\nabla_\theta s_{i,t}(\theta) \;=\; s_i(\theta_{old}) \cdot \frac{\nabla_\theta \pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}.
+$$
+
+So the *value* of the surrogate equals GSPO's sequence-level surrogate (gradient-aware clipping behaves the same), but the *gradient* flows through each token's own log-prob, weighted by a sequence-level scalar. Now you can apply a per-token mask $m_{i,t}$ to the loss and have the masked gradient be exactly what you want:
+
+$$
+\mathcal{J}_{\text{GSPO-token}}(\theta) \;=\; \mathbb{E}\!\left[\, \frac{1}{G}\sum_{i=1}^G \frac{1}{\sum_t m_{i,t}}\sum_{t=1}^{|o_i|} m_{i,t} \cdot \min\!\Bigl( s_{i,t}(\theta)\, \hat{A}_{i,t},\; \mathrm{clip}\!\bigl(s_{i,t}(\theta), 1-\varepsilon, 1+\varepsilon\bigr)\, \hat{A}_{i,t} \Bigr) \,\right].
+$$
+
+This is exactly GSPO when $\hat{A}_{i,t} = \hat{A}_i$ and $m_{i,t} = 1$ (verify: every token contributes the same surrogate value, and the sum/normalization recovers $\min(s_i \hat{A}_i, \ldots)$). It is *strictly more flexible* — you can have per-token advantages (process supervision) or per-token masks (multi-turn) — while preserving GSPO's sequence-level clipping behaviour.
+
+### What stays the same
+
+It is worth being explicit about how *little* of the GRPO recipe changes:
+
+- **Group sampling.** Still $G$ responses per prompt from $\pi_{\theta_{old}}$.
+- **Advantage.** Still $\hat{A}_i = (r_i - \bar{r}) / \mathrm{std}(r)$.
+- **Reference KL.** Still optional, still computed with the k3 estimator if used. The Qwen paper's main runs use it; the structure of the KL term is unchanged.
+- **No value network.** Same.
+- **Rollout / training loop.** Same — same prompts, same generations, same forward passes. Different aggregation in the loss.
+
+The implementation diff between a GRPO trainer and a GSPO trainer is on the order of a few dozen lines.
+
+## Part 4 — GRPO vs GSPO, side by side
+
+| Question | GRPO | GSPO |
+|---|---|---|
+| IS unit | Per token | Per sequence (geometric mean of per-token ratios) |
+| Clip unit | Per token, range $\sim$0.2 | Per sequence, range $\sim$3e-4 |
+| Advantage | Group-normalized, broadcast to every token | Group-normalized, applied once per response |
+| Per-token credit | Yes (via per-token ratio magnitude) | No, by default — recoverable via GSPO-token |
+| MoE routing drift | Each flipped token contributes a noisy ratio | Averages out within the sequence |
+| Long responses | Variance grows; clipping fires often | Stable; length-normalization keeps $s_i$ bounded |
+| Routing Replay needed for MoE | Yes (in practice) | No |
+| Value network | None | None |
+| Reference KL | Yes (k3 estimator) | Yes (same form) |
+| Implementation diff vs PPO | Big (no critic, group baselines) | Bigger (also sequence-level loss) |
+
+A useful one-liner: **GRPO replaces the critic with a group; GSPO additionally replaces the per-token surrogate with a per-sequence one.** They both throw away a piece of standard PPO machinery. GRPO throws away the value head. GSPO throws away the per-token IS unit.
+
+Another way to see GSPO: it is the natural answer to the question *"what is the largest unit you can importance-sample with a single sample?"* — for sequence-level rewards, that unit is the sequence, and any attempt to split it into smaller per-token units injects noise without adding information. GRPO's per-token surrogate is essentially borrowed from PPO, where it was designed for *per-step* rewards in MDPs (Atari, MuJoCo). LLM RL with end-of-sequence verifier rewards is not that kind of MDP.
+
+## Part 5 — When to use which
+
+Some practical heuristics from open recipes:
+
+- **Dense model, short responses (under 2k tokens), 0/1 verifier reward.** GRPO is fine. The per-token IS unit's variance is manageable at short length, the implementation is mature, and you save the per-step migration cost. Most math-RL recipes (GSM8K, MATH) live in this regime.
+- **Dense model, long responses (8k–32k tokens, long-CoT).** GRPO works but you'll want token-level loss normalization, possibly asymmetric clip ranges (DAPO-style), and tight monitoring of clip rates. GSPO is a worth-trying-once switch — the diff is small and the stability win is real.
+- **MoE model, any context length.** GSPO. Strongly. The routing-flip story is real; people have wasted entire H100 clusters on MoE GRPO instability. The Qwen team's reported result — removing Routing Replay entirely — is on its own enough reason to start with GSPO for MoE RL.
+- **Multi-turn RL with token masking.** GSPO-token. The per-token formulation in the GSPO-token variant gives you the flexibility GSPO lacks while preserving sequence-level IS.
+- **Process supervision available.** GRPO-P or GSPO-token (with per-token advantages). The choice between them is the same as the dense-vs-MoE question above.
+
+## Part 6 — A worked example
+
+Consider one response of length $|o| = 4$ with token log-probabilities under the two policies:
+
+| $t$ | $\log \pi_{\theta_{old}}$ | $\log \pi_\theta$ | per-token log-ratio |
+|---|---|---|---|
+| 1 | $-2.0$ | $-1.9$ | $+0.1$ |
+| 2 | $-1.0$ | $-0.7$ | $+0.3$ |
+| 3 | $-3.0$ | $-3.5$ | $-0.5$ |
+| 4 | $-0.5$ | $-0.4$ | $+0.1$ |
+
+Assume this response received a normalized advantage $\hat{A}_i = +1$, and clip range $\varepsilon$ where applicable.
+
+**GRPO surrogate** (no clipping for simplicity):
+
+$$
+\frac{1}{4}\sum_{t=1}^4 e^{\ell_t} \cdot 1 \;=\; \frac{1}{4}(1.105 + 1.350 + 0.607 + 1.105) \;\approx\; 1.04.
+$$
+
+But notice the token at $t=3$ has ratio $0.607$, well inside a typical $\varepsilon=0.2$ clip range $[0.8, 1.2]$ — it would be clipped to $0.8$ when $\hat{A} > 0$ (the clip rule selects the lower value because higher $r_t$ with positive advantage is what we *want* to bound). Token $t=2$ has ratio $1.350$, also clipped (to $1.2$). The clipped per-token average becomes $(1.105 + 1.2 + 0.8 + 1.105)/4 = 1.05$. Two out of four tokens contribute zero gradient.
+
+**GSPO surrogate**:
+
+$$
+\log s_i = \frac{1}{4}(0.1 + 0.3 - 0.5 + 0.1) = 0,\quad s_i = 1.
+$$
+
+The per-token ratios cancelled out. The sequence-level ratio is essentially 1, no clipping fires, and the full sequence contributes $1 \cdot \hat{A}_i = 1$ to the loss. The fact that *individual tokens* drifted in either direction is irrelevant — the *sequence* as a whole was sampled from a policy that is still close to the current one.
+
+Now flip the scenario: imagine $t=2$ and $t=3$ both happened to land on tokens whose expert routing has flipped under $\pi_\theta$. The per-token log-ratios might be $+1.5$ and $-1.5$. Under GRPO both of those tokens would get heavily clipped and zero-gradient. Under GSPO, $\log s_i$ shifts by $(1.5 - 1.5)/4 = 0$ — completely invisible at the sequence level. The MoE-routing intuition in concrete numbers.
+
+## Part 7 — Subtleties and gotchas
+
+A few details that bite people implementing these for the first time.
+
+### 1. Sampling and training must use exact-same logits
+
+PPO/GRPO/GSPO all assume $\pi_{\theta_{old}}$'s log-probs from rollout time exactly match the log-probs that *would be computed* by the training-time framework if it ran $\pi_{\theta_{old}}$ again. In practice, sampling uses an inference engine (vLLM, SGLang, TRT-LLM) and training uses a training framework (Megatron, DeepSpeed, FSDP). They can disagree in the last bits of fp16/bf16 due to different kernels, different attention implementations, etc. Those last-bit differences appear in the IS ratio as systematic bias and can quietly destabilize training. Common fixes: log-prob a second time inside the training framework rather than trusting the inference engine's log-probs, or align numerical kernels across the two. Under GSPO this matters less because per-token differences get averaged, but it is still worth being aware of.
+
+### 2. The KL term's gradient direction
+
+The k3 estimator estimates $\mathbb{D}_{\mathrm{KL}}[\pi_\theta \,\|\, \pi_{\text{ref}}]$, gradient w.r.t. $\theta$. Adding it as a *negative* term in the maximization objective penalizes drift from $\pi_{\text{ref}}$. Some implementations get the sign wrong (or compute KL in the other direction by mistake) and the policy is then *pushed away from* the reference, which empirically looks like the model "improving" for a few steps and then collapsing. Read the sign carefully.
+
+### 3. Per-token advantages need to live in the right place
+
+If you adopt GSPO-token to mix in process supervision, the gradient analysis we did relies on $s_{i,t}(\theta)$ being inside the $\min$/clip *with* $\hat{A}_{i,t}$. A common bug is to compute the clipped sequence ratio outside and multiply it onto per-token advantages downstream — that recovers GSPO's gradient, not GSPO-token's intended per-token-credit gradient. The placement matters.
+
+### 4. Clip-fraction monitoring
+
+For both algorithms, the *fraction of tokens (GRPO) or sequences (GSPO) whose ratio falls outside the clip range* is the single most informative training-time diagnostic. If GRPO's per-token clip fraction is $>20\%$ you are likely past the rollout's useful life — either refresh $\pi_{\theta_{old}}$ more aggressively, lower the learning rate, or take fewer epochs per rollout. For GSPO the analogous sequence clip-fraction stays small as long as the per-sequence average log-ratio is well-controlled; runaway clip fraction is a sign that $\varepsilon$ is too tight or the learning rate is too high.
+
+### 5. Group size and reward variance
+
+Group-normalized advantage assumes the group has nonzero reward variance. If *all* $G$ responses to a prompt get the same reward (typically: all wrong or all right), $\mathrm{std}(r) = 0$, the advantage is undefined, and the loss for that prompt is degenerate. Common fixes: drop those prompts from the batch (this is what most implementations do), or use an additive constant $\epsilon$ in the denominator. Both are fine; what is not fine is to silently produce NaNs.
+
+### 6. Reference-free GSPO/GRPO
+
+DeepSeek-R1 famously runs *with $\beta = 0$* in the final RL stage — no reference KL at all. This is viable when (a) the reward is a non-gameable rule-based verifier and (b) the reward signal is rich enough to constrain the policy to coherent outputs. For RM-based rewards (DPO-style preference RMs), you almost certainly want $\beta > 0$ to prevent reward-model exploitation. GSPO inherits the same logic.
+
+## Closing
+
+The arc from PPO → GRPO → GSPO is what gradual specialization to LLM RL looks like. PPO came from the deep-RL toolbox with all the per-step machinery intact: value network, per-token IS ratio, per-token clip. GRPO threw out the piece that was clearly broken for sparse-reward long-horizon tasks (the value network) and replaced it with the cheapest thing that worked (a group baseline). GSPO threw out the next piece that was clearly broken once group RL met MoE at scale (the per-token IS ratio) and replaced it with the cheapest thing that worked (a sequence-level IS unit).
+
+Both moves trade off some theoretical generality for a lot of practical stability. Both moves are tied to specific features of LLM RL — sparse end-of-sequence rewards, long responses, large models that are expensive to forward. Neither move is the last one. If you are designing the next post-training algorithm in 2026 the question to ask is: *which piece of inherited PPO machinery, now that I look at it with fresh eyes, doesn't actually fit the regime I'm in?*
+
+### References
+
+- Shao, Z. et al. *DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.* [arXiv:2402.03300](https://arxiv.org/abs/2402.03300), 2024. (GRPO)
+- DeepSeek-AI. *DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.* [arXiv:2501.12948](https://arxiv.org/abs/2501.12948), 2025.
+- Zheng, C. et al. *Group Sequence Policy Optimization.* [arXiv:2507.18071](https://arxiv.org/abs/2507.18071), 2025. (GSPO)
+- Schulman, J. et al. *Proximal Policy Optimization Algorithms.* [arXiv:1707.06347](https://arxiv.org/abs/1707.06347), 2017.
+- Schulman, J. *Approximating KL Divergence.* [http://joschu.net/blog/kl-approx.html](http://joschu.net/blog/kl-approx.html).
+- Yu, Q. et al. *DAPO: An Open-Source LLM Reinforcement Learning System at Scale.* [arXiv:2503.14476](https://arxiv.org/abs/2503.14476), 2025.

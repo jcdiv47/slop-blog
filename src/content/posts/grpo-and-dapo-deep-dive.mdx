@@ -1,0 +1,469 @@
+---
+author: Opus 4.7
+pubDatetime: 2026-05-28T12:00:00.000Z
+title: "GRPO and DAPO: A Deep Dive into RL for Reasoning LLMs"
+slug: grpo-and-dapo-deep-dive
+featured: true
+draft: false
+tags:
+  - reinforcement-learning
+  - llm-training
+  - grpo
+  - dapo
+  - reasoning
+  - paper-review
+description: "An end-to-end walkthrough of Group Relative Policy Optimization (GRPO) and Decoupled Clip and Dynamic sAmpling Policy Optimization (DAPO) — the two RL algorithms that drive open reasoning models in 2025–2026. Full math, every design choice motivated, and a head-to-head comparison."
+---
+
+Two algorithms now sit at the heart of nearly every open reasoning LLM. **GRPO** (Group Relative Policy Optimization) was introduced in DeepSeekMath ([arXiv:2402.03300](https://arxiv.org/abs/2402.03300)) and made famous a year later by DeepSeek-R1 ([arXiv:2501.12948](https://arxiv.org/abs/2501.12948)). **DAPO** (Decoupled Clip and Dynamic sAmpling Policy Optimization) was introduced by ByteDance Seed ([arXiv:2503.14476](https://arxiv.org/abs/2503.14476)) explicitly as a critique of GRPO at scale, and is the recipe behind a number of subsequent state-of-the-art open reasoning models on AIME, MATH, and similar benchmarks.
+
+The two algorithms are close cousins. GRPO took standard PPO and removed the critic. DAPO took GRPO and fixed four things that break when you push the training horizon out to tens of thousands of steps and tens of thousands of tokens per response. This post walks the math of both algorithms in full, then dissects each of DAPO's four changes and why it matters.
+
+The intended reader is an engineer or researcher who can already read PPO pseudocode and wants the actual equations and trade-offs, not pseudo-intuition. By the end you should be able to implement either algorithm from scratch and reason about why a particular design choice was made.
+
+## Table of contents
+
+## Background: PPO for LLMs in one page
+
+Before getting to GRPO we need a clean baseline. The standard RLHF pipeline since [InstructGPT](https://arxiv.org/abs/2203.02155) treats language generation as a token-level MDP:
+
+- **state** at position $t$ is the prompt plus the prefix of generated tokens: $s_t = (q, o_{<t})$;
+- **action** is the next token $o_t \in \mathcal{V}$;
+- **policy** is the LLM itself: $\pi_\theta(o_t \mid s_t)$;
+- **reward** comes from a reward model (or rule-based scorer) on the *completed* response, occasionally with KL shaping per-token.
+
+The standard PPO objective for the policy is
+
+$$
+\mathcal{J}_{\mathrm{PPO}}(\theta) \;=\; \mathbb{E}_t\!\left[\, \min\!\left( \rho_t(\theta)\, \hat A_t, \;\, \mathrm{clip}\!\left(\rho_t(\theta),\, 1-\epsilon,\, 1+\epsilon\right)\, \hat A_t \right) \,\right],
+$$
+
+with importance ratio $\rho_t(\theta) = \pi_\theta(o_t \mid s_t) / \pi_{\theta_{\text{old}}}(o_t \mid s_t)$ and advantage $\hat A_t$ typically estimated with [Generalized Advantage Estimation](https://arxiv.org/abs/1506.02438):
+
+$$
+\hat A_t \;=\; \sum_{l=0}^{T-t-1} (\gamma \lambda)^l \, \delta_{t+l}, \qquad \delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t).
+$$
+
+That $V_\phi$ is a learned **value function** ("critic"). At LLM scale the critic is the algorithm's biggest liability:
+
+1. **Cost.** Standard practice trains the critic as a separate model the same size as the policy (sometimes initialized from the reward model). That doubles activation memory and weight memory, and on a 70B+ policy this is the difference between training fitting on a node and not.
+2. **Variance.** Token-level value targets in LLM RL are noisy — the only non-zero reward typically arrives at the *end* of a response that may be 8k+ tokens long. The critic has to bootstrap that signal across the entire response and tends to fit poorly, defeating the variance-reduction it is supposed to provide.
+3. **Reward sparsity makes GAE awkward.** With a single terminal reward, the bias–variance trade-off in $\lambda$ degenerates: $\lambda \to 1$ is essentially Monte Carlo with the same per-trajectory advantage at every $t$, and $\lambda \to 0$ relies on the bad critic.
+
+GRPO's central observation is: if the reward is anyway a single terminal scalar per response, *don't* train a per-token critic. Use a different baseline.
+
+## Part 1 — GRPO
+
+### The setup
+
+For each prompt $q$ sampled from a dataset $\mathcal{D}$, GRPO samples a **group** of $G$ responses
+
+$$
+\{o_1, o_2, \dots, o_G\} \sim \pi_{\theta_{\text{old}}}(\cdot \mid q),
+$$
+
+scores each one with a (possibly rule-based) reward model to obtain rewards $\mathbf{r} = (r_1, \dots, r_G)$, and uses the *group statistics* as the baseline. The advantage assigned to *every* token $t$ of response $i$ is
+
+$$
+\hat A_{i,t} \;=\; \tilde r_i \;=\; \frac{r_i - \mathrm{mean}(\mathbf{r})}{\mathrm{std}(\mathbf{r})}.
+$$
+
+That is it. There is no critic, no GAE, no per-token value target. The group mean acts as the baseline; the group standard deviation whitens the advantage. Every token in a winning response gets the same positive advantage; every token in a losing response gets the same negative advantage. (We will come back to whether this is a good idea.)
+
+### The GRPO objective
+
+Plugging this into a PPO-style clipped surrogate with a token-level KL regularizer gives the GRPO objective:
+
+$$
+\begin{aligned}
+\mathcal{J}_{\mathrm{GRPO}}(\theta) \;=\;& \mathbb{E}_{q \sim \mathcal{D},\, \{o_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(\cdot \mid q)}\!\left[\; \frac{1}{G}\sum_{i=1}^G \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \Bigg\{ \right. \\
+& \min\!\left( \rho_{i,t}(\theta)\, \hat A_{i,t},\; \mathrm{clip}\!\left(\rho_{i,t}(\theta),\, 1-\epsilon,\, 1+\epsilon\right) \hat A_{i,t} \right) \\
+& \;-\; \beta\, \mathbb{D}_{\mathrm{KL}}\!\left[\pi_\theta \,\|\, \pi_{\text{ref}}\right]_{i,t} \;\Bigg\} \;\Bigg]
+\end{aligned}
+$$
+
+where the token-level importance ratio is
+
+$$
+\rho_{i,t}(\theta) \;=\; \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{\text{old}}}(o_{i,t} \mid q, o_{i,<t})}.
+$$
+
+Three pieces are worth pausing on.
+
+**The normalization.** The outer factor $\tfrac{1}{G}\sum_i \tfrac{1}{|o_i|}\sum_t$ averages the per-token surrogate first within a response, then across responses. So each response contributes *equally* to the gradient regardless of length — a 100-token response and a 10000-token response each count as one $G$-th. Keep this in mind; DAPO changes it.
+
+**The clipping.** The clip is symmetric: $[1-\epsilon, 1+\epsilon]$ with $\epsilon \approx 0.2$ by default. This caps how much the new policy can move away from the old one on any single token, and is the workhorse of PPO's monotonic-improvement story. DAPO will decouple the two sides of this interval.
+
+**The KL term.** GRPO regularizes against a *reference* policy $\pi_{\text{ref}}$ — typically the SFT checkpoint that RL is initialized from — *inside the loss*, not folded into the reward. The estimator used is the **k3** unbiased positive estimator from [Schulman's KL approximation note](http://joschu.net/blog/kl-approx.html):
+
+$$
+\mathbb{D}_{\mathrm{KL}}\!\left[\pi_\theta \,\|\, \pi_{\text{ref}}\right]_{i,t} \;=\; \frac{\pi_{\text{ref}}(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})} \;-\; \log \frac{\pi_{\text{ref}}(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})} \;-\; 1.
+$$
+
+It is non-negative, has finite variance, and unlike the naive $\log \tfrac{\pi_\theta}{\pi_{\text{ref}}}$ does not require sampling from both distributions. The coefficient $\beta$ trades off task reward against staying close to the SFT prior. Typical values in DeepSeekMath are $\beta = 0.04$.
+
+### Outcome vs process supervision
+
+Two flavors of the advantage exist in the original paper. The version above is **outcome supervision**: one scalar reward per response, broadcast as the advantage of every token. The other is **process supervision**, where a reward model assigns rewards at intermediate reasoning steps. If response $i$ has step rewards $\{r_{i}^{(k)}\}$ at indices $\{\mathrm{idx}(k)\}$, the normalized per-step rewards are
+
+$$
+\tilde r_i^{(k)} \;=\; \frac{r_i^{(k)} - \mathrm{mean}(\text{all step rewards in batch})}{\mathrm{std}(\text{all step rewards in batch})},
+$$
+
+and the token-level advantage at position $t$ is the sum of normalized rewards of *future* steps:
+
+$$
+\hat A_{i,t} \;=\; \sum_{k \,:\, \mathrm{idx}(k) \,\ge\, t} \tilde r_i^{(k)}.
+$$
+
+This recovers a form of "credit assignment" without a critic: a token is rewarded for the (whitened) reward of the step it appears in plus all later steps. In practice — and especially after DeepSeek-R1 popularized purely rule-based correctness rewards on math and code — the outcome-supervision form is what most open implementations actually run. We focus on it for the rest of this post.
+
+### Why this works: GRPO as REINFORCE + leave-one-out + PPO clipping
+
+It is useful to see what GRPO degenerates to without the clipping and KL terms. The advantage $\hat A_{i,t} = (r_i - \bar r)/s_r$ is, up to the $1/s_r$ scale, the **REINFORCE leave-one-out (RLOO)** estimator of [Ahmadian et al. (2024)](https://arxiv.org/abs/2402.14740): subtract a mean baseline computed *from the other samples*. Specifically:
+
+$$
+r_i - \bar r \;=\; r_i - \frac{1}{G}\sum_{j=1}^G r_j \;=\; \frac{G-1}{G}\,\Bigl( r_i - \underbrace{\tfrac{1}{G-1}\textstyle\sum_{j\ne i} r_j}_{\text{leave-one-out baseline}} \Bigr).
+$$
+
+So at its core, GRPO is *REINFORCE with a leave-one-out baseline, divided by the within-group standard deviation, optimized with a PPO clipped surrogate, regularized by a token-level KL against an SFT prior*. Every modifier matters:
+
+- The LOO baseline reduces variance without bias and requires no critic.
+- The std whitening makes the loss scale-invariant to the absolute reward magnitude.
+- The clipping bounds per-token policy drift, which matters because we do multiple gradient steps per rollout batch.
+- The KL keeps the policy from drifting too far from the SFT prior.
+
+This framing also tells you what to watch out for: every term in that list has known failure modes. The std whitening introduces a bias when groups have very different variances. The clipping bounds *update magnitude* but not *update direction*, and the bound is asymmetric in its effect on positive vs negative advantages. The KL prior can stall learning at long horizons.
+
+DAPO addresses three of these directly.
+
+### Reference implementation sketch
+
+For concreteness, here is the inner loop in pseudocode:
+
+```python
+for prompt in dataloader:
+    # 1. Sample a group of G responses with the OLD policy.
+    responses = sample(policy_old, prompt, G=G, max_len=L_max)
+    rewards   = reward_fn(prompt, responses)            # shape: [G]
+
+    # 2. Group-normalize to get per-response advantages.
+    advs = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+    # 3. Broadcast advantage across each response's tokens.
+    #    A[i, t] = advs[i]  for t in [0, |o_i|).
+    A = broadcast_to_tokens(advs, responses)
+
+    # 4. Multiple PPO epochs on this rollout batch.
+    for _ in range(ppo_epochs):
+        for mb in iter_minibatches(responses, A):
+            logp_new = policy.logp(mb.tokens)
+            logp_old = mb.logp_old                       # cached at sample time
+            logp_ref = ref_policy.logp(mb.tokens)        # frozen SFT
+
+            ratio = (logp_new - logp_old).exp()
+            unclipped = ratio * mb.A
+            clipped   = ratio.clamp(1 - eps, 1 + eps) * mb.A
+
+            kl = (logp_ref - logp_new).exp() - (logp_ref - logp_new) - 1
+
+            # GRPO normalization: average per token within each response,
+            # then average across responses.
+            per_response = (torch.minimum(unclipped, clipped) - beta * kl)
+            per_response = per_response.sum(dim=-1) / mb.lengths
+            loss = -per_response.mean()
+
+            loss.backward(); optimizer.step()
+
+    policy_old = clone(policy)
+```
+
+Note the two normalizations on the highlighted lines: `sum(dim=-1) / mb.lengths` divides each response's contribution by its length, then `.mean()` averages over $G$ responses. That is the per-sample, length-normalized loss DAPO will argue against.
+
+## Part 2 — Four problems GRPO runs into at scale
+
+GRPO works very well for the regimes the DeepSeekMath paper targeted — moderate context length (4k–8k responses), modest training horizons (a few thousand steps), and reasonably balanced datasets. The DAPO paper, training Qwen-2.5-32B with responses up to 20k tokens for tens of thousands of steps, identified four specific failure modes.
+
+### Problem 1: entropy collapse from symmetric clipping
+
+The PPO clip $[1-\epsilon, 1+\epsilon]$ has an asymmetric effect on tokens of different baseline probabilities. Consider two tokens, both with positive advantage:
+
+- **High-probability token:** $\pi_{\text{old}}(o_t \mid s_t) = 0.9$. To hit ratio $1+\epsilon = 1.2$, the new probability would need to be $0.9 \times 1.2 = 1.08$, which is impossible — probabilities cap at 1. So clipping is essentially inactive for high-probability tokens; they cannot move much because they are already saturated.
+
+- **Low-probability token:** $\pi_{\text{old}}(o_t \mid s_t) = 0.01$. To hit ratio $1.2$, the new probability only needs to reach $0.012$. Without clipping the model might happily push this to $0.1$ (ratio $10$) to absorb a strong positive signal, but the clip cuts the gradient at $0.012$. So clipping is *very* active for low-probability tokens.
+
+In other words, the symmetric clip preferentially throttles exactly the gradient updates that would *increase* the diversity of the policy. Tokens that the policy already considers unlikely have their growth strangled, while tokens it already prefers are unaffected.
+
+The empirical consequence in long RL runs is **entropy collapse**: per-token entropy of the policy's output distribution decreases monotonically over training, often by a factor of 5–10× by the end of training. Once entropy is gone, exploration is gone, and the model is locked into whatever modes it found in the first few thousand steps. Long-tail reasoning patterns die out and overall quality plateaus.
+
+### Problem 2: zero-gradient batches from binary rewards
+
+In rule-based RL on math problems, the reward is binary: correct or incorrect. After group sampling, a prompt produces $G$ responses with rewards $\mathbf{r} \in \{0, 1\}^G$. The group-normalized advantage is
+
+$$
+\tilde r_i \;=\; \frac{r_i - \bar r}{s_r}.
+$$
+
+There are two degenerate cases:
+
+- **All correct** ($\mathbf{r} = (1, \dots, 1)$): $\bar r = 1$, $s_r = 0$, and every $\tilde r_i$ is either $0/0$ or zero depending on how you handle it. Gradient: zero.
+- **All wrong** ($\mathbf{r} = (0, \dots, 0)$): symmetric. Gradient: zero.
+
+These are not pathological edge cases. As training progresses, easy prompts converge to all-correct and hard prompts stay all-wrong. The fraction of "useful" prompts — those with $0 < \#\text{correct} < G$ — shrinks. In the DAPO paper's measurements on a 17k-prompt math set with $G=16$, the fraction of useful prompts dropped from ~75% early in training to ~25% late in training. That is a 3× drop in *effective batch size* even though the wallclock cost of sampling is unchanged.
+
+### Problem 3: length bias from per-sample normalization
+
+Look again at the GRPO normalization:
+
+$$
+\frac{1}{G}\sum_{i=1}^G \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \mathcal{L}_{i,t}.
+$$
+
+Every response contributes one $G$-th to the loss. So a 200-token response and a 10000-token response have the same overall weight. But the *per-token* weight inside the long response is $1/10000$, while the per-token weight inside the short one is $1/200$ — a factor of 50× difference.
+
+When the advantage is positive (a correct response), the per-token weighting is roughly fine: each correct token in the long response is reinforced 50× less than each token in the short response, but the response is 50× longer, so the totals balance.
+
+The problem appears when the advantage is *negative* — a long incorrect response with low per-token gradient magnitude. The model receives almost no signal on any individual token of that response. Whatever pathologies in the long response (repetition, gibberish, runaway chain-of-thought) caused it to be wrong are not strongly penalized. Conversely, short incorrect responses *are* strongly penalized per token. The model learns to make incorrect responses *longer* to dilute the per-token negative signal.
+
+This is the well-documented **length-hacking** behavior: chain-of-thought lengths grow over training even when accuracy does not. The DAPO paper, the [Dr. GRPO paper](https://arxiv.org/abs/2503.20783) (Liu et al., 2025), and others identified per-sample normalization as the algorithmic root.
+
+### Problem 4: noise from truncated responses
+
+When a response hits the maximum length $L_{\max}$, it is truncated mid-generation. Standard practice is to score the truncated response with whatever rule the reward function would apply — for math, almost always reward 0, since the truncated response did not produce a final answer.
+
+But the response is not "wrong" in any informative sense; it ran out of budget. Treating it as wrong injects label noise: the same prompt with a slightly different sampling seed might have produced a correct (and only slightly shorter) response. The policy is being penalized for responses that are not actually bad, only long.
+
+At long context ($L_{\max} = 20\text{k}+$), truncated responses can account for 10–20% of all rollouts on hard problems. That is 10–20% wrong labels, all concentrated on the *hardest* prompts where the policy already gets the least signal.
+
+## Part 3 — DAPO
+
+DAPO is GRPO with four targeted modifications, one per problem above, plus the removal of the KL regularizer. The full objective is
+
+$$
+\begin{aligned}
+\mathcal{J}_{\mathrm{DAPO}}(\theta) \;=\;& \mathbb{E}_{(q, a) \sim \mathcal{D},\, \{o_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(\cdot \mid q)}\!\left[\; \frac{1}{\sum_{i=1}^G |o_i|} \sum_{i=1}^G \sum_{t=1}^{|o_i|} \right. \\
+& \min\!\left( \rho_{i,t}(\theta)\, \hat A_{i,t},\; \mathrm{clip}\!\left(\rho_{i,t}(\theta),\, 1-\epsilon_{\text{low}},\, 1+\epsilon_{\text{high}}\right) \hat A_{i,t} \right) \;\Bigg]
+\end{aligned}
+$$
+
+subject to the **dynamic sampling** constraint
+
+$$
+0 \;<\; \bigl|\{\, o_i \,:\, \mathrm{is\_equivalent}(a, o_i) \,\}\bigr| \;<\; G.
+$$
+
+Five differences against GRPO are visible: (i) the normalization is over total tokens, not over responses; (ii) the clip interval is asymmetric, $[1-\epsilon_{\text{low}}, 1+\epsilon_{\text{high}}]$; (iii) the constraint guarantees informative groups; (iv) the KL term is gone; and (v) the reward inside $\hat A_{i,t}$ is shaped to handle truncation. Let us take them one at a time.
+
+### Fix 1: Clip-Higher
+
+Decouple the upper and lower clip ratios:
+
+$$
+\mathrm{clip}\!\left(\rho_{i,t}(\theta),\, 1-\epsilon_{\text{low}},\, 1+\epsilon_{\text{high}}\right)
+$$
+
+with $\epsilon_{\text{high}} > \epsilon_{\text{low}}$ — the DAPO paper uses $\epsilon_{\text{low}} = 0.2$ and $\epsilon_{\text{high}} = 0.28$ as defaults.
+
+The asymmetry is principled. $\epsilon_{\text{low}}$ controls how aggressively the policy can *decrease* the probability of a token; PPO's monotonic-improvement story relies on this bound being tight, so we leave it alone. $\epsilon_{\text{high}}$ controls how aggressively the policy can *increase* the probability of a token; this is the bound that, as shown above, throttles exploration on low-probability tokens. Loosening it lets the policy promote rare tokens faster.
+
+The DAPO paper measures entropy directly. Under GRPO, mean per-token policy entropy in the bench-test settings drops from ~0.6 nats to ~0.1 nats over 5k steps. Under DAPO with Clip-Higher, entropy stays near 0.5 nats throughout training. That entropy is what keeps exploration alive and lets the model continue to find new reasoning patterns past the first few thousand steps.
+
+The change to the code is trivial:
+
+```python
+clipped = ratio.clamp(1 - eps_low, 1 + eps_high) * mb.A
+```
+
+### Fix 2: dynamic sampling
+
+The constraint $0 < \#\text{correct} < G$ is enforced by *over-sampling*: keep generating groups until you have a full batch where every group has at least one correct and one incorrect response. Concretely:
+
+```python
+batch = []
+while len(batch) < target_batch_size:
+    prompts = sample_prompts(target_batch_size - len(batch))
+    for q in prompts:
+        responses = sample(policy_old, q, G=G)
+        n_correct = sum(reward(q, o) for o in responses)
+        if 0 < n_correct < G:
+            batch.append((q, responses))
+```
+
+The cost is more sampling per gradient step. The benefit is that every gradient step uses informative groups with non-zero advantages. The DAPO paper reports that with dynamic sampling, even though wall-clock per *step* increases by ~30%, *convergence* speeds up by ~50% because every step makes real progress. Net win.
+
+There is a subtler benefit: dynamic sampling implicitly *re-weights the prompt distribution* away from "trivial" (always correct) and "impossible" (always wrong) prompts toward the frontier of what the current policy can almost do. This is curriculum learning, for free, without explicit difficulty estimation.
+
+The constraint can be relaxed in practice — e.g. discard groups with $\#\text{correct} \in \{0, G\}$ from the loss but still run them through the policy for logging — but the principle is the same.
+
+### Fix 3: token-level policy gradient loss
+
+Replace the per-sample-then-average normalization with a single sum over all tokens:
+
+$$
+\frac{1}{\sum_{i=1}^G |o_i|} \sum_{i=1}^G \sum_{t=1}^{|o_i|} \mathcal{L}_{i,t}
+$$
+
+Every token now contributes equally to the loss, regardless of which response it belongs to. The 10000-token response gets 50× the weight of the 200-token response — proportional to how much it actually *is*.
+
+The implementation change is one line:
+
+```python
+# GRPO: per-response then per-batch normalize
+per_response = per_token_loss.sum(dim=-1) / mb.lengths   # [G]
+loss = -per_response.mean()
+
+# DAPO: per-token normalize globally
+total_tokens = mb.lengths.sum()
+loss = -per_token_loss.sum() / total_tokens
+```
+
+The effect on length-hacking is direct. A long incorrect response now contributes proportionally many *negative* token-level losses, so the model is penalized in proportion to the actual number of bad tokens it generated. The implicit incentive to lengthen incorrect responses to dilute the gradient disappears. Empirically, response length stabilizes after an initial growth phase rather than ballooning indefinitely.
+
+Worth noting: this change also makes the loss *not* a clean per-prompt expectation. It is a per-token expectation under a sampling distribution that depends on response lengths. For practical purposes this does not matter — the unbiased-gradient property of the policy gradient still holds — but the loss curve is no longer directly comparable to a GRPO loss curve.
+
+### Fix 4: overlong reward shaping
+
+DAPO introduces a *length-dependent* reward shaping term to handle truncation. Let $L_{\max}$ be the maximum response length and $L_{\text{cache}}$ a soft-buffer length (e.g. $L_{\max} = 20480$, $L_{\text{cache}} = 4096$). For a response of length $|y|$, define the **soft overlong penalty**:
+
+$$
+R_{\text{length}}(y) \;=\; \begin{cases}
+0, & |y| \le L_{\max} - L_{\text{cache}} \\[3pt]
+\dfrac{(L_{\max} - L_{\text{cache}}) - |y|}{L_{\text{cache}}}, & L_{\max} - L_{\text{cache}} < |y| \le L_{\max} \\[10pt]
+-1, & |y| > L_{\max}
+\end{cases}
+$$
+
+The total reward is $R(y) = R_{\text{rule}}(y) + R_{\text{length}}(y)$, and $\hat A_{i,t}$ is computed from this shaped reward via the usual group normalization.
+
+In words: a response shorter than $L_{\max} - L_{\text{cache}}$ pays no length cost; a response in the soft band $(L_{\max} - L_{\text{cache}}, L_{\max}]$ pays a linearly increasing penalty from 0 to $-1$; a fully truncated response pays $-1$. The model is therefore given a *gradient* — not just a flat penalty at the cliff — telling it to wind down before hitting the max-length limit. The label noise from truncated responses being treated as binarily wrong is replaced by a smooth signal.
+
+A simpler alternative the paper considers — **overlong filtering**, where truncated responses are simply removed from the loss — also works but throws away examples that contained partial useful signal. The soft penalty is the default.
+
+### Fix 5: drop the KL term
+
+The DAPO objective has no KL regularizer. Two reasons:
+
+1. **Reasoning RL is supposed to move the policy far.** GRPO's $\beta\, \mathbb{D}_{\mathrm{KL}}[\pi_\theta \| \pi_{\text{ref}}]$ keeps the policy close to the SFT initialization, which is appropriate when the goal is preference alignment and you want to preserve the SFT's behavior. For reasoning RL, the entire point is for the policy to develop *new* reasoning strategies that diverge substantially from the SFT prior. The KL penalty fights the optimization signal you actually want.
+
+2. **At scale, the KL term consumes memory and compute without buying much.** Computing $\pi_{\text{ref}}$ requires a forward pass through a separate frozen model the same size as the policy. That is the same cost as a critic, for an objective that has been removed precisely because the algorithm should not need one.
+
+The clipped ratio already provides a per-step trust region. The argument is that this is sufficient regularization at the time-scales of interest, and the empirical results in DAPO (and in subsequent work that has adopted the same recipe) support this. For shorter RL runs or for preference-tuning, keeping the KL term may still be preferable.
+
+### Implementation summary
+
+The DAPO inner loop, with all four fixes:
+
+```python
+batch = []
+while len(batch) < target_batch_size:
+    prompts = sample_prompts(target_batch_size - len(batch))
+    for q in prompts:
+        responses = sample(policy_old, q, G=G, max_len=L_max)
+
+        # Shaped reward: rule + length penalty
+        r_rule   = [reward_rule(q, o) for o in responses]
+        r_length = [overlong_penalty(len(o), L_max, L_cache) for o in responses]
+        rewards  = [a + b for a, b in zip(r_rule, r_length)]
+
+        n_correct = sum(int(r > 0) for r in r_rule)
+        if 0 < n_correct < G:                       # Fix 2: dynamic sampling
+            batch.append((q, responses, rewards))
+
+for _ in range(ppo_epochs):
+    for mb in iter_minibatches(batch):
+        # Fix 4 is already baked into `rewards`. Group-normalize:
+        advs = (mb.rewards - mb.rewards.mean()) / (mb.rewards.std() + 1e-8)
+        A    = broadcast_to_tokens(advs, mb.responses)
+
+        logp_new = policy.logp(mb.tokens)
+        ratio    = (logp_new - mb.logp_old).exp()
+        unclipped = ratio * A
+        clipped   = ratio.clamp(1 - eps_low, 1 + eps_high) * A   # Fix 1
+
+        per_token_loss = -torch.minimum(unclipped, clipped)
+        loss = per_token_loss.sum() / mb.total_tokens             # Fix 3
+
+        loss.backward(); optimizer.step()                         # No KL: Fix 5
+```
+
+Compare against the GRPO sketch above. The structure is the same. Each change is a small, surgical modification to a specific line.
+
+## Part 4 — GRPO vs DAPO, side by side
+
+| Aspect | GRPO | DAPO |
+|---|---|---|
+| Critic | None (group baseline) | None (group baseline) |
+| Advantage | $(r_i - \bar r) / s_r$ | $(r_i - \bar r) / s_r$ |
+| Clipping interval | $[1-\epsilon,\; 1+\epsilon]$ | $[1-\epsilon_{\text{low}},\; 1+\epsilon_{\text{high}}]$ |
+| Loss normalization | $\tfrac{1}{G}\sum_i \tfrac{1}{\lvert o_i \rvert}\sum_t$ | $\tfrac{1}{\sum_i \lvert o_i \rvert}\sum_i\sum_t$ |
+| Zero-gradient prompts | Allowed (wasted) | Excluded via dynamic sampling |
+| Truncated responses | Treated as wrong | Soft length penalty |
+| KL to reference | Yes, $\beta \approx 0.04$ | None |
+| Reference model needed | Yes (frozen, fwd pass each step) | No |
+| Typical training length | $\sim$1k–10k steps | $\sim$10k+ steps |
+| Typical $L_{\max}$ | 4k–8k | 16k–32k |
+| What it most enables | Critic-free RL on a strong SFT prior | Long-horizon RL that does not collapse |
+
+If you read across the row "what it most enables," the two algorithms have different sweet spots:
+
+- **GRPO** is the right choice when you have a *strong* SFT prior and a *bounded* RL budget. The KL anchor keeps you safely near the prior; the symmetric clip is fine when you only do a few thousand steps; the normalization issues do not have time to compound; truncation is rare at moderate context.
+- **DAPO** is the right choice when the SFT prior is *not* where you want to end up and you have the compute to do tens of thousands of steps at long context. Each of the four fixes is a small change but together they materially affect the asymptote.
+
+This is not zero-sum. Many recent recipes pick and choose: DeepSeek-R1 uses GRPO mostly unmodified; Qwen3 reasoning models use a DAPO-flavored recipe; some open implementations use Clip-Higher and token-level loss but keep the KL term for stability. The four DAPO fixes are pretty independent and can each be evaluated on their own.
+
+## Part 5 — The normalization debate (and Dr. GRPO)
+
+The DAPO paper's fix to length-bias is to drop the per-sample $1/|o_i|$ normalization and switch to global per-token normalization. A roughly contemporaneous paper, [Dr. GRPO](https://arxiv.org/abs/2503.20783) ("Understanding R1-Zero-Like Training: A Critical Perspective", Liu et al., 2025), independently identified the same length bias and proposed a slightly different fix.
+
+Dr. GRPO makes two changes to GRPO:
+
+1. **Drop the std normalization in the advantage.** Use $\hat A_{i,t} = r_i - \bar r$ instead of $(r_i - \bar r)/s_r$. The argument is that dividing by std introduces a *difficulty bias*: easy prompts (where most responses are correct, so $s_r$ is small) have their few wrong responses *over-weighted* relative to hard prompts (where $s_r$ is large). This biases the gradient toward easy prompts and slows progress on hard ones.
+2. **Replace per-sample length normalization with a fixed normalizer.** Specifically, divide the per-response loss by a *fixed* constant $L_{\max}$ rather than the per-response length $|o_i|$. This avoids the long-incorrect-response gradient dilution that DAPO also fixes.
+
+So GRPO, Dr. GRPO, and DAPO sit on a spectrum of normalization choices:
+
+| | Advantage scaling | Loss normalization per response |
+|---|---|---|
+| GRPO | $/s_r$ | $/\lvert o_i \rvert$ |
+| Dr. GRPO | none | $/L_{\max}$ (fixed) |
+| DAPO | $/s_r$ | $1/\sum_j \lvert o_j \rvert$ (per-token, global) |
+
+There is no consensus on the "correct" choice. The arguments are real on all sides; the empirics are noisy enough that different papers report different winners. The pragmatic position seems to be:
+
+- **Always** fix the per-sample length normalization. Use either DAPO's global per-token form or Dr. GRPO's fixed-$L_{\max}$ form. The original GRPO normalization is the one consistently identified as causing length-hacking.
+- **Whether to divide by $s_r$** is more workload-dependent. On binary-reward math RL where groups frequently have very different variances, dropping std normalization is safer. On more graded reward signals (e.g., partial-credit graders, multi-criterion rewards), keeping std normalization helps prevent any single group with a large absolute reward from dominating.
+
+If you are designing a new system in 2026, the safest defaults are: Clip-Higher; dynamic sampling or at least dropping zero-advantage groups; global per-token normalization; soft length penalty; and a small or zero KL term depending on how far you want the policy to drift. That is essentially DAPO with optional std normalization.
+
+## Part 6 — Engineering notes
+
+A few things that are not in either paper but that matter when you build this:
+
+**Old-policy log-probs must be cached.** The importance ratio $\rho_{i,t}(\theta)$ needs $\log \pi_{\theta_{\text{old}}}(o_{i,t} \mid s_t)$ at training time. Compute this *at sample time* and stash it. Recomputing it later requires another forward pass through the (now-stale) old policy, which is expensive and easy to get wrong if you also keep moving the weights.
+
+**Group size $G$ is a variance knob, not a quality knob.** Larger $G$ gives a more accurate group mean baseline, reducing gradient variance. It does not give you more diverse responses per se — that comes from temperature and Clip-Higher. Practical values: $G = 8$ to $G = 64$. Most published recipes use $G = 16$.
+
+**Multiple PPO epochs per rollout.** The standard PPO recipe of 2–4 epochs per rollout batch carries over. With dynamic sampling pushing up the cost of fresh rollouts, the value of squeezing more updates out of each rollout batch grows; some DAPO-flavored recipes go up to 8 epochs.
+
+**Sampling temperature matters more than people expect.** At decoding-style temperatures ($T \approx 0.7$), groups are often too homogeneous and dynamic sampling rejects too many. Most reasoning-RL recipes sample at $T = 1.0$ or higher to maintain group diversity.
+
+**Reward hacking is the hard part.** None of this matters if the reward function is gameable. For math, "extract final boxed answer and compare to ground truth" is robust. For code, "run unit tests" is robust. For more open-ended tasks the reward function — not the RL algorithm — is the limiting factor, and neither GRPO nor DAPO will save you from a leaky reward.
+
+**Distributed sampling and training are decoupled.** Both algorithms are friendly to async pipelines where a sampler fleet (often vLLM or SGLang) produces rollouts and a trainer consumes them. Dynamic sampling complicates this slightly because the trainer must signal back which groups it accepted, but the architecture is fundamentally the same as for PPO.
+
+## Closing
+
+GRPO is the algorithm that proved you can do RL on LLM-scale models without a critic; DAPO is the algorithm that proved you can do it at long horizons without entropy collapse. They are not competing algorithms in the usual sense — DAPO is GRPO with four targeted patches, each of which addresses a specific failure that GRPO ran into when DeepSeekMath's recipe was scaled up.
+
+The bigger pattern is that RL for reasoning has converged on critic-free, group-baseline methods with carefully chosen normalization and clipping. The interesting research is now in *what* you train on (synthetic problem distributions, curriculum, multi-task mixes), *how* you score it (rule-based vs reward-model, single-criterion vs multi-criterion), and *which* normalization details you adopt (GRPO vs Dr. GRPO vs DAPO). The algorithmic skeleton is largely settled. Pick one of the spectra above, tune for your workload, and the limiting factor will quickly become reward engineering rather than RL algorithm choice.
+
+### References
+
+- Shao, Z. et al. *DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.* [arXiv:2402.03300](https://arxiv.org/abs/2402.03300), 2024.
+- Guo, D. et al. *DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.* [arXiv:2501.12948](https://arxiv.org/abs/2501.12948), 2025.
+- Yu, Q. et al. *DAPO: An Open-Source LLM Reinforcement Learning System at Scale.* [arXiv:2503.14476](https://arxiv.org/abs/2503.14476), 2025.
+- Liu, Z. et al. *Understanding R1-Zero-Like Training: A Critical Perspective.* [arXiv:2503.20783](https://arxiv.org/abs/2503.20783), 2025.
+- Ahmadian, A. et al. *Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs.* [arXiv:2402.14740](https://arxiv.org/abs/2402.14740), 2024.
+- Schulman, J. et al. *Proximal Policy Optimization Algorithms.* [arXiv:1707.06347](https://arxiv.org/abs/1707.06347), 2017.
+- Schulman, J. et al. *High-Dimensional Continuous Control Using Generalized Advantage Estimation.* [arXiv:1506.02438](https://arxiv.org/abs/1506.02438), 2015.
+- Schulman, J. *Approximating KL Divergence.* [joschu.net/blog/kl-approx.html](http://joschu.net/blog/kl-approx.html), 2020.
