@@ -7,6 +7,7 @@ import {
 import tailwindcss from "@tailwindcss/vite";
 import mdx from "@astrojs/mdx";
 import sitemap from "@astrojs/sitemap";
+import { unified } from "@astrojs/markdown-remark";
 import remarkToc from "remark-toc";
 import remarkCollapse from "remark-collapse";
 import remarkMath from "remark-math";
@@ -14,6 +15,7 @@ import remarkDirective from "remark-directive";
 import rehypeKatex from "rehype-katex";
 import rehypeKatexHeadingText from "./src/utils/rehypeKatexHeadingText";
 import remarkAsideDirective from "./src/utils/remark-aside-directive";
+import rehypeCallouts from "rehype-callouts";
 import {
   transformerNotationDiff,
   transformerNotationHighlight,
@@ -39,15 +41,18 @@ export default defineConfig({
     },
   },
   markdown: {
-    remarkPlugins: [
-      remarkMath,
-      remarkToc,
-      [remarkCollapse, { test: "Table of contents" }],
-      remarkDirective,
-      remarkAsideDirective,
-    ],
-    // rehypeKatexHeadingText must run after rehypeKatex; see plugin source for why.
-    rehypePlugins: [rehypeKatex, rehypeKatexHeadingText],
+    processor: unified({
+      remarkPlugins: [
+        remarkMath,
+        remarkToc,
+        [remarkCollapse, { test: "Table of contents" }],
+        remarkDirective,
+        remarkAsideDirective,
+      ],
+      // rehypeKatexHeadingText must run after rehypeKatex.
+      rehypePlugins: [rehypeKatex, rehypeKatexHeadingText, rehypeCallouts],
+    }),
+
     shikiConfig: {
       themes: { light: "min-light", dark: "night-owl" },
       defaultColor: false,
@@ -63,10 +68,7 @@ export default defineConfig({
   vite: {
     plugins: [tailwindcss()],
     server: {
-      allowedHosts: [
-        "blog.h.jiaqicai.com",
-        "jiaqicai.com"
-      ],
+      allowedHosts: ["blog.h.jiaqicai.com", "jiaqicai.com"],
     },
   },
   fonts: [

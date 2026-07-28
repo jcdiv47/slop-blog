@@ -27,4 +27,8 @@ pnpm-debug.log*
 public/pagefind
 
 # arxiv sources
-.arxiv-sources/
+.arxiv-sources/# pnpm
+.pnpm-store
+
+# docker compose
+compose.override.yaml
